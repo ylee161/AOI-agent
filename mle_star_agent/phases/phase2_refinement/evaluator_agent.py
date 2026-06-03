@@ -386,6 +386,53 @@ def evaluate_and_update_fn(tool_context) -> str:
     current_best_f1 = float(tool_context.state.get("best_f1", 0.0))
     no_improve           = int(tool_context.state.get("no_improve_count", 0))
 
+    # ---- debug pre-check: fast smoke run before paying for the full run ----
+    # Patches the script to max_epochs=1 + 5% data and caps the timeout at
+    # DEBUG_CHECK_TIMEOUT_SECONDS. If it fails, the script is broken and there is
+    # no point spending hours on the full run — record the failure and bail.
+    logger.info("Evaluator debug pre-check (outer=%d, inner=%d)", n, m)
+    debug_result = code_runner.run_script(
+        script,
+        timeout=config.TIMEOUT_SECONDS,
+        env={"AOI_RANDOM_SEED": "42", "PYTHONHASHSEED": "42", "SEED": "42"},
+        debug_mode=True,
+    )
+    if debug_result.returncode != 0:
+        logger.warning(
+            "Debug pre-check failed (outer=%d, inner=%d, rc=%d) — skipping full run",
+            n, m, debug_result.returncode,
+        )
+        m_next = m + 1
+        tool_context.state["inner_iteration"] = m_next
+        no_improve += 1
+        tool_context.state["no_improve_count"] = no_improve
+
+        config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        attempt_data = {
+            "outer_iteration": n,
+            "inner_iteration": m_next,
+            "returncode":      debug_result.returncode,
+            "timed_out":       debug_result.timed_out,
+            "duration_ms":     round(debug_result.duration_ms, 1),
+            "improved":        False,
+            "failure_reason":  "debug_check_failed",
+            "new_score":       0.0,
+            "new_overkill":    1.0,
+            "current_best_score":   float(tool_context.state.get("current_best_score", 0.0)),
+            "current_best_overkill": float(tool_context.state.get("best_overkill_rate", 1.0)),
+            "no_improve_count":   no_improve,
+            "metrics":         None,
+            "stdout_tail":     debug_result.stdout[-3000:],
+            "stderr_tail":     debug_result.stderr[-1000:],
+        }
+        save_checkpoint(config.ckpt_refinement(n, m), attempt_data)
+        return (
+            f"DEBUG CHECK FAILED (outer={n}, inner={m}): script exited with "
+            f"returncode={debug_result.returncode} in the accelerated smoke run; "
+            f"full run skipped. inner_iteration now {m_next}, "
+            f"no_improve_count now {no_improve}."
+        )
+
     # ---- execute the script ----
     logger.info("Evaluator running script (outer=%d, inner=%d)", n, m)
     result = code_runner.run_script(
