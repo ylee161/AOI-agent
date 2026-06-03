@@ -20,7 +20,7 @@ CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 # folder per lot, each containing the lot's PNG images and a single .xlsx label
 # sheet. The default matches the bundled SUP046 lots, whose folders look like
 # "[SUP046]2026040301.0002_VHB48301B0701". The "[[]" escapes the literal "[".
-DATASET_GLOB = "[[]SUP046]*"
+DATASET_GLOB = "aoi_agent_dataset/[[]SUP046]*"
 
 # Resolved list of lot folders (sorted for determinism). Leave this as-is.
 DATASET_FOLDERS = sorted(glob.glob(str(PROJECT_ROOT / DATASET_GLOB)))
@@ -93,6 +93,7 @@ PROBE_PROBABILITY_GAP_MIN = 0.05  # require NG mean probability to exceed G mean
 
 # Execution
 TIMEOUT_SECONDS = 7200  # 2 hours — ResNet18 15-epoch CPU training takes ~45-60 min per script
+DEBUG_CHECK_TIMEOUT_SECONDS = 120  # cap for debug_mode smoke runs (max_epochs=1, 5% data)
 DEBUGGER_RETRY_CAP = 3
 
 # Token budget
