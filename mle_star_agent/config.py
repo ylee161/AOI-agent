@@ -132,6 +132,7 @@ CKPT_SUBMISSION = CHECKPOINT_DIR / "submission.json"
 CKPT_SUBMISSION_ATTEMPTS = CHECKPOINT_DIR / "submission_attempts.json"
 CKPT_TRIED_APPROACHES = CHECKPOINT_DIR / "tried_approaches.json"
 CKPT_TRIED_ENSEMBLE_APPROACHES = CHECKPOINT_DIR / "tried_ensemble_approaches.json"
+CKPT_PERSISTENT_KB = CHECKPOINT_DIR / "persistent_aoi_kb.json"
 
 
 def ckpt_ablation(n: int) -> Path:

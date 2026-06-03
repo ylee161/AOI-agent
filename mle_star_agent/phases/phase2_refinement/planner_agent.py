@@ -187,6 +187,50 @@ def _merge_tried_histories(*histories: list[dict]) -> list[dict]:
     ))
     return merged
 
+def _persistent_kb_summary() -> str:
+    """Compact cross-run KB block for the planner prompt.
+
+    Reads the append-only persistent_aoi_kb.json written by the evaluator. Surfaces
+    the top 5 success records by ng_recall and every failure record (plan + metrics)
+    so the planner can avoid repeating cross-run dead ends. Returns "" silently if
+    the file does not exist or is unusable — never raises.
+    """
+    if not checkpoint_exists(config.CKPT_PERSISTENT_KB):
+        return ""
+    try:
+        records = load_checkpoint(config.CKPT_PERSISTENT_KB)
+    except RuntimeError:
+        return ""
+    if not isinstance(records, list) or not records:
+        return ""
+
+    successes = [r for r in records if isinstance(r, dict) and r.get("label") == "success"]
+    failures = [r for r in records if isinstance(r, dict) and r.get("label") == "failure"]
+
+    def _ng_recall(record: dict) -> float:
+        metrics = record.get("metrics") or {}
+        try:
+            return float(metrics.get("ng_recall", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    top_successes = sorted(successes, key=_ng_recall, reverse=True)[:5]
+    top_view = [
+        {"plan": r.get("plan", ""), "metrics": r.get("metrics", {})}
+        for r in top_successes
+    ]
+    failure_view = [
+        {"plan": r.get("plan", ""), "metrics": r.get("metrics", {})}
+        for r in failures
+    ]
+    return (
+        "PERSISTENT_KB_SUMMARY (cross-run AOI knowledge base — "
+        f"{len(records)} total record(s)):\n"
+        f"TOP_SUCCESSES (by ng_recall, max 5): {json.dumps(top_view, default=str)}\n"
+        f"FAILURES (avoid repeating): {json.dumps(failure_view, default=str)}"
+    )
+
+
 def load_tried_approaches_fn(tool_context) -> str:
     """
     Restore tried_approaches from state, persisted history, and refinement
@@ -259,11 +303,14 @@ def load_tried_approaches_fn(tool_context) -> str:
     else:
         modality_block = "INPUT_MODALITY: stereo"
 
+    kb_summary = _persistent_kb_summary()
+    kb_block = f"\n\n{kb_summary}" if kb_summary else ""
     return (
         f"{modality_block}\n\n"
         f"{status}\n\n"
         f"{_tried_approaches_view(tried)}\n\n"
         f"{_context_reports_block(tool_context.state)}"
+        f"{kb_block}"
     )
 
 

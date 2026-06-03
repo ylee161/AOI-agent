@@ -21,7 +21,11 @@ from mle_star_agent.shared.callbacks import (
     log_context_size_callback,
     rate_limit_retry_callback,
 )
-from mle_star_agent.shared.checkpoint_io import save_checkpoint
+from mle_star_agent.shared.checkpoint_io import (
+    checkpoint_exists,
+    load_checkpoint,
+    save_checkpoint,
+)
 from mle_star_agent.shared.metrics_parser import (
     AOIMetrics,
     metrics_to_dict,
@@ -622,25 +626,42 @@ def evaluate_and_update_fn(tool_context) -> str:
     tried = list(tool_context.state.get("tried_approaches", []) or [])
     plan = tool_context.state.get("refinement_plan") or {}
     selected_strategy = tool_context.state.get("selected_refinement_strategy", "")
+    result_dict = {
+        "ng_recall": round(new_score, 4),
+        "miss_rate": round(float(metrics.miss_rate), 4) if metrics else 1.0,
+        "overkill": round(new_overkill, 4),
+        "accuracy": round(float(metrics.accuracy), 4) if metrics else 0.0,
+        "improved": improved,
+    }
     tried.append({
         "outer": n, "inner": m,
         "target_component": plan.get("target_component", "unknown"),
         "changes_summary": plan.get("changes_summary", ""),
         "selected_strategy": selected_strategy,
         "strategy_fingerprint": tool_context.state.get("selected_strategy_fingerprint"),
-        "result": {
-            "ng_recall": round(new_score, 4),
-            "miss_rate": round(float(metrics.miss_rate), 4) if metrics else 1.0,
-            "overkill": round(new_overkill, 4),
-            "accuracy": round(float(metrics.accuracy), 4) if metrics else 0.0,
-            "improved": improved,
-        },
+        "result": result_dict,
         "prediction_verification": prediction_verification,
         "failure_reason": failure_reason,
     })
     tool_context.state["tried_approaches"] = tried
     config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     save_checkpoint(config.CKPT_TRIED_APPROACHES, {"tried_approaches": tried})
+
+    # Persistent AOI knowledge base (MLEvolve): append-only cross-run memory.
+    # Each record has exactly four fields: plan, code_snippet, metrics, label.
+    # Load the existing list first and write the whole list back — never overwrite.
+    kb_records = []
+    if checkpoint_exists(config.CKPT_PERSISTENT_KB):
+        existing_kb = load_checkpoint(config.CKPT_PERSISTENT_KB)
+        if isinstance(existing_kb, list):
+            kb_records = list(existing_kb)
+    kb_records.append({
+        "plan": selected_strategy,
+        "code_snippet": script[:300],
+        "metrics": result_dict,
+        "label": "success" if improved else "failure",
+    })
+    save_checkpoint(config.CKPT_PERSISTENT_KB, kb_records)
 
     # Build a human-readable metrics line for the return value
     if probe_rejected:
