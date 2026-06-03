@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Secrets / local config
+.env
+.adk/
+.claude/
+
+# Model weights & checkpoints
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+workspace/
+ablation_results/
+ablations/
+
+# Datasets (user supplies their own)
+[SUP046]*/
+data/
+data_split/
+data_split.json
+excel_labels/
+images/
+*.bmp
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+
+# Experiment / scratch scripts (not part of the agent)
+_*.py
+run_mini_goal_*.py
+mg16_*.py
+smoke_*.py
+parse_*.py
+p1_diagnosis.py
+deploy_server.py
+run.sh
+start_web.sh
+make_grouped_split.py
+verify_fixes_*.py
+*_results.json
+*.log
+*.json
+
+# PDF / paper files
+*.pdf
+*.txt.bak
+mle_star_paper*.txt
+mle_star_paper*.md
+aoi_spec.txt
+
+# macOS
+.DS_Store
+
+# pytest cache
+.pytest_cache/
