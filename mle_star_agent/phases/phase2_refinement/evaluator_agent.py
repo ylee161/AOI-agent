@@ -35,6 +35,7 @@ from mle_star_agent.shared.diagnosis_scorer import (
     parse_threshold_curve,
     detect_early_collapse,
 )
+from mle_star_agent.phases.phase2_refinement.ideator_agent import trigger_ideation
 
 logger = logging.getLogger(__name__)
 
@@ -655,6 +656,11 @@ def evaluate_and_update_fn(tool_context) -> str:
         tool_context.state["no_improve_count"] = 0
         tool_context.state["force_fresh_ablation"] = True
         _clear_ablation_state(tool_context.state)
+        # Dynamic ideation injection (Fix #1): the idea pool has gone stale — the
+        # inner loop stalled below relaxed acceptance. Pull fresh, failure-mode-keyed
+        # technique hints from arXiv into state["retrieved_technique_hints"] BEFORE
+        # escalating, so the next diagnosis/planning cycle has new levers to try.
+        ideation_status = trigger_ideation(tool_context)
         _save_best_pipeline(tool_context.state)
         tool_context.actions.escalate = True
         logger.info(
@@ -666,7 +672,8 @@ def evaluate_and_update_fn(tool_context) -> str:
             f"INNER_STAGNATION: no improvement for "
             f"{config.INNER_STAGNATION_MAX_UNCONSTRAINED} below-relaxed attempts. "
             f"outer_iteration advanced to {n_next}, inner_iteration reset to 0, "
-            "and ablation state cleared. Escalating inner loop; outer loop continues."
+            "and ablation state cleared. Escalating inner loop; outer loop continues.\n"
+            f"{ideation_status}"
         )
 
     # ---- Priority 2: mid-inner early-stop ----
