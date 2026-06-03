@@ -32,6 +32,21 @@ adk run mle_star_agent      # interactive
 # or: adk web               # browser UI; pick "mle_star_root"
 ```
 
+### Convenience scripts
+
+Two optional wrappers are included:
+
+```bash
+./run.sh           # retry-wrapped `adk run` — auto-restarts on transient
+                   #   API errors and resumes from checkpoints. Ctrl-C to stop.
+./start_web.sh     # launches the `adk web` UI and opens your browser
+./start_web.sh 8080  # ...on a custom port
+```
+
+Both auto-detect a project-local `.venv/bin/adk`, falling back to `adk` on your
+`PATH`. For a one-word launcher, add a shell alias, e.g.
+`alias aoi='bash /path/to/AOI-agent/run.sh'`.
+
 ## Configuring it for your dataset
 
 All dataset-specific knobs live at the top of
