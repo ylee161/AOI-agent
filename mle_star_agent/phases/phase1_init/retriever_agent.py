@@ -47,25 +47,97 @@ logger = logging.getLogger(__name__)
 
 _SEARCH_TIMEOUT = 20.0
 _MAX_RESULTS = 6
+# Fetch a few extra so the authority/diversity re-rank (see _prioritize_and_trim)
+# has something to choose from before we trim back down to _MAX_RESULTS.
+_FETCH_RESULTS = 9
+# Per-result page text (Tavily raw_content) surfaced to the LLM so it writes
+# example code from REAL current pages, not just titles/snippets from memory.
+_RAW_CONTENT_CHARS = 700
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
+
+# Authoritative sources to float to the top of every result list (#5). Primary
+# literature / official docs / code beat random blog and video results. Ordered
+# by preference; matching is substring-on-domain so subdomains also match.
+_AUTHORITATIVE_DOMAINS = (
+    "arxiv.org",
+    "paperswithcode.com",
+    "openreview.net",
+    "proceedings.mlr.press",
+    "pytorch.org",
+    "docs.pytorch.org",
+    "huggingface.co",
+    "github.com",
+    "pmc.ncbi.nlm.nih.gov",
+    "nature.com",
+    "sciencedirect.com",
+    "ieeexplore.ieee.org",
+    "mdpi.com",
+    "springer.com",
+)
+
+
+def _domain(url: str) -> str:
+    m = re.match(r"\s*https?://([^/]+)", url or "")
+    return m.group(1).lower().removeprefix("www.") if m else ""
+
+
+def _authority_rank(url: str) -> int:
+    """Lower is better. Authoritative domains rank by their list position; everything
+    else ranks last (so blogs/videos sink below papers and official docs)."""
+    d = _domain(url)
+    for i, auth in enumerate(_AUTHORITATIVE_DOMAINS):
+        if d == auth or d.endswith("." + auth) or auth in d:
+            return i
+    return len(_AUTHORITATIVE_DOMAINS)
+
+
+def _prioritize_and_trim(results: list[dict], limit: int = _MAX_RESULTS) -> list[dict]:
+    """Re-rank one query's results: authoritative sources first (#5), then one per
+    domain before repeats so the kept set spans distinct sources (#6). Nothing is
+    discarded until the final trim to `limit`, so content is never lost — only reordered."""
+    ranked = sorted(results, key=lambda r: _authority_rank(r.get("url", "")))
+    seen: set[str] = set()
+    first_per_domain: list[dict] = []
+    repeats: list[dict] = []
+    for r in ranked:
+        d = _domain(r.get("url", ""))
+        if d and d not in seen:
+            seen.add(d)
+            first_per_domain.append(r)
+        else:
+            repeats.append(r)
+    return (first_per_domain + repeats)[:limit]
 
 # ---------------------------------------------------------------------------
 # Pluggable web search (real API -> keyless DuckDuckGo -> graceful signal)
 # ---------------------------------------------------------------------------
 
 def _search_tavily(query: str, api_key: str) -> list[dict]:
+    # search_depth="advanced" → better-ranked results; include_raw_content=True →
+    # the actual page text, so the LLM can ground example code in real pages (#2).
     resp = httpx.post(
         "https://api.tavily.com/search",
-        json={"api_key": api_key, "query": query, "max_results": _MAX_RESULTS},
+        json={
+            "api_key": api_key,
+            "query": query,
+            "max_results": _FETCH_RESULTS,
+            "search_depth": "advanced",
+            "include_raw_content": True,
+        },
         timeout=_SEARCH_TIMEOUT,
     )
     resp.raise_for_status()
     data = resp.json()
     return [
-        {"title": r.get("title", ""), "snippet": r.get("content", ""), "url": r.get("url", "")}
+        {
+            "title": r.get("title", ""),
+            "snippet": r.get("content", ""),
+            "url": r.get("url", ""),
+            "raw": (r.get("raw_content") or "")[:_RAW_CONTENT_CHARS],
+        }
         for r in data.get("results", [])
     ]
 
@@ -74,14 +146,19 @@ def _search_serper(query: str, api_key: str) -> list[dict]:
     resp = httpx.post(
         "https://google.serper.dev/search",
         headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
-        json={"q": query, "num": _MAX_RESULTS},
+        json={"q": query, "num": _FETCH_RESULTS},
         timeout=_SEARCH_TIMEOUT,
     )
     resp.raise_for_status()
     data = resp.json()
     out = []
-    for r in data.get("organic", [])[:_MAX_RESULTS]:
-        out.append({"title": r.get("title", ""), "snippet": r.get("snippet", ""), "url": r.get("link", "")})
+    for r in data.get("organic", [])[:_FETCH_RESULTS]:
+        out.append({
+            "title": r.get("title", ""),
+            "snippet": r.get("snippet", ""),
+            "url": r.get("link", ""),
+            "raw": "",  # Serper does not return full page content
+        })
     return out
 
 
@@ -102,8 +179,8 @@ def _search_duckduckgo(query: str) -> list[dict]:
     text = resp.text
     results: list[dict] = []
     for m in re.finditer(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', text, re.S):
-        results.append({"title": _strip_tags(m.group(2)), "snippet": "", "url": m.group(1)})
-        if len(results) >= _MAX_RESULTS:
+        results.append({"title": _strip_tags(m.group(2)), "snippet": "", "url": m.group(1), "raw": ""})
+        if len(results) >= _FETCH_RESULTS:
             break
     snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', text, re.S)
     for i, s in enumerate(snippets[: len(results)]):
@@ -139,8 +216,6 @@ def web_search(query: str) -> str:
             "ViT/DeiT families) — do NOT default to a legacy ResNet18-only choice."
         )
 
-    logger.info("web_search via %s for %r — %d result(s)", source, query, len(results))
-
     if not results:
         return (
             f"SEARCH_EMPTY for query {query!r}. No results returned. Use your knowledge "
@@ -148,12 +223,21 @@ def web_search(query: str) -> str:
             "ResNet18-only choice."
         )
 
+    # Authority-first, source-diverse re-rank, then trim to the display count.
+    results = _prioritize_and_trim(results, _MAX_RESULTS)
+    logger.info("web_search via %s for %r — %d result(s) after re-rank", source, query, len(results))
+
     lines = [f"SEARCH RESULTS ({source}) for: {query}"]
     for i, r in enumerate(results, 1):
         snippet = r.get("snippet", "").strip()
+        raw = r.get("raw", "").strip()
         lines.append(f"[{i}] {r.get('title', '').strip()}")
         if snippet:
             lines.append(f"    {snippet}")
+        if raw:
+            # Collapse whitespace so the page excerpt stays compact in the prompt.
+            raw = re.sub(r"\s+", " ", raw)
+            lines.append(f"    PAGE EXCERPT: {raw}")
         lines.append(f"    {r.get('url', '').strip()}")
     return "\n".join(lines)
 
@@ -246,28 +330,38 @@ Call `check_retriever_needed_fn`.
 - If it returns RETRIEVAL_NEEDED: continue.
 
 ## STEP 1 — Ensure the data split (so you know the task)
-Call `ensure_data_split_fn`. Note the reported `input_modality` (stereo or mono) and the
-train size — you will use the modality in one of your search queries and to describe the task.
+Call `ensure_data_split_fn`. From its output, record the TASK PROFILE you will search with:
+- TRAIN_SIZE — the number of training samples (this is a SMALL dataset; the exact count matters).
+- CLASS_BALANCE — the NG (defect) vs G (good) counts, i.e. how imbalanced the task is.
+- MODALITY — "stereo" or "mono".
+You will bake these real numbers into your queries below — generic queries waste the search.
 
-## STEP 2 — Run EXACTLY 4 web searches
-Call `web_search` exactly four times, once per query below. Substitute the detected modality
-into query 3 (use the literal word "stereo" or "mono"):
-1. "best PyTorch pretrained model binary image classification small dataset 2024 2025"
-2. "state of the art lightweight image classification PyTorch few hundred samples pretrained"
-3. "PyTorch <modality> image defect detection industrial inspection pretrained backbone"
-4. "EfficientNet ViT ConvNeXT small data image classification PyTorch example code"
+## STEP 2 — Run EXACTLY 4 web searches (DATA-AWARE)
+Call `web_search` exactly four times. Build each query from the TASK PROFILE you just recorded —
+substitute the ACTUAL train size, class-imbalance wording, and modality. Use these as templates:
+1. "pretrained PyTorch image classification <TRAIN_SIZE> training samples transfer learning overfitting prevention"
+2. "lightweight CNN small dataset binary defect pass/fail classification imbalanced high precision pretrained"
+3. "PyTorch <MODALITY> surface defect detection industrial inspection pretrained backbone small data"
+4. "EfficientNet ConvNeXt ViT DeiT timm torchvision small dataset fine-tuning example code"
 
-Read every result. If a query returns SEARCH_UNAVAILABLE / SEARCH_EMPTY, still proceed using
-your knowledge of CURRENT small-data backbones — never fall back to a legacy ResNet18-only set.
+Read every result, INCLUDING the `PAGE EXCERPT:` lines — those are real text from the source page,
+so prefer them over your own memory when writing example code (APIs change). If a query returns
+SEARCH_UNAVAILABLE / SEARCH_EMPTY, still proceed using your knowledge of CURRENT small-data
+backbones — never fall back to a legacy ResNet18-only set.
 
-## STEP 3 — Extract 4 candidates
-From the search results, identify 4 DISTINCT, modern, pretrained PyTorch architectures that
-suit binary industrial defect detection (pass/fail) on a few-hundred-sample dataset. For each:
+## STEP 3 — Extract 4 candidates (DIVERSE ON THE AXIS THAT MATTERS)
+From the search results, identify 4 modern, pretrained PyTorch architectures that suit binary
+industrial defect detection (pass/fail) on a dataset of only ~TRAIN_SIZE samples. For each:
 - model_name: the architecture name (e.g. "EfficientNet-B0", "ConvNeXt-Tiny", "ViT-Tiny", "DeiT-Small").
-- description: 1-2 sentences on why it suits a small-data binary defect-detection task.
+- description: 1-2 sentences on why it suits THIS small, imbalanced binary defect task.
 - example_code: a minimal PyTorch snippet that loads/instantiates the model with pretrained
-  weights and adapts the head for binary output (use torchvision or timm as the search suggests).
-Prefer diversity across the 4 (different families/sizes). Do not return four near-identical models.
+  weights and adapts the head for binary output (use torchvision or timm as the pages suggest).
+Diversity rule — on a few-hundred-sample task, model capacity / data-hunger is the axis that
+matters, not just the family name. So your 4 MUST:
+- include at least ONE lightweight option (<10M params, e.g. EfficientNet-B0 / ConvNeXt-Nano/Tiny / MobileNetV3);
+- include at MOST two transformer-family models (transformers are data-hungry and overfit small sets);
+- span a range of sizes rather than four similarly-large models.
+Do not return four near-identical models.
 
 ## STEP 4 — Store
 Call `store_retrieved_candidates` with a JSON array of your 4 objects

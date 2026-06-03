@@ -29,7 +29,8 @@ def ensure_data_split_fn(tool_context) -> str:
         stats = data.get("stats", {})
         return (
             f"Data split loaded from checkpoint: "
-            f"train={stats.get('train_size')}, val={stats.get('val_size')}, test={stats.get('test_size')}"
+            f"train={stats.get('train_size')}, val={stats.get('val_size')}, test={stats.get('test_size')} "
+            f"(NG={stats.get('ng_count')}, G={stats.get('g_count')}, total={stats.get('total')})"
             f" | input_modality={modality}"
         )
 
