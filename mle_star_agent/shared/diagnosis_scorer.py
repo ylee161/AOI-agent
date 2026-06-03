@@ -127,6 +127,30 @@ def classify_failure_mode(
         if ps.get("NG", {}).get("mean") is not None:
             ng_prob_mean = ps["NG"]["mean"]
 
+    if overkill > 0.40 and threshold_curve:
+        curve_summary = summarize_threshold_curve(threshold_curve)
+        threshold_can_escape_overkill = any(
+            _threshold_point_overkill(point) < 0.20 for point in threshold_curve
+        )
+        if not threshold_can_escape_overkill:
+            return {
+                "failure_mode": "g_ng_overlap",
+                "confidence": "high",
+                "evidence": (
+                    f"overkill={overkill:.3f}; threshold_curve has "
+                    f"{curve_summary['points']} points but no point reaches overkill<0.20"
+                ),
+                "recommended_target": mono_overlap_target if is_mono else "stereo_fusion",
+                "recommended_action": (
+                    "Thresholding cannot solve this failure. Force representation work: "
+                    + mono_overlap_action
+                    if is_mono else
+                    "Thresholding cannot solve this failure. Force representation/stereo "
+                    "separability work: 9-channel L/R/diff input, stronger difference features, "
+                    "or SSIM/attention features before further threshold tuning."
+                ),
+            }
+
     if prob_gap <= config.PROBE_PROBABILITY_GAP_MIN:
         return {
             "failure_mode": "full_freeze_underfit",
@@ -185,30 +209,6 @@ def classify_failure_mode(
             }
 
     # --- Overkill decision tree (P2): only reached when miss_rate <= 0.03 ---
-    if overkill > 0.40 and threshold_curve:
-        curve_summary = summarize_threshold_curve(threshold_curve)
-        threshold_can_escape_overkill = any(
-            _threshold_point_overkill(point) < 0.20 for point in threshold_curve
-        )
-        if not threshold_can_escape_overkill:
-            return {
-                "failure_mode": "g_ng_overlap",
-                "confidence": "high",
-                "evidence": (
-                    f"overkill={overkill:.3f}; threshold_curve has "
-                    f"{curve_summary['points']} points but no point reaches overkill<0.20"
-                ),
-                "recommended_target": mono_overlap_target if is_mono else "stereo_fusion",
-                "recommended_action": (
-                    "Thresholding cannot solve this failure. Force representation work: "
-                    + mono_overlap_action
-                    if is_mono else
-                    "Thresholding cannot solve this failure. Force representation/stereo "
-                    "separability work: 9-channel L/R/diff input, stronger difference features, "
-                    "or SSIM/attention features before further threshold tuning."
-                ),
-            }
-
     if overkill > 0.40:
         if g_prob_mean is not None and g_prob_mean > 0.50:
             return {

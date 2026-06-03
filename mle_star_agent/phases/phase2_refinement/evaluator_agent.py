@@ -392,11 +392,11 @@ def evaluate_and_update_fn(tool_context) -> str:
         timeout=config.TIMEOUT_SECONDS,
         env={"AOI_RANDOM_SEED": "42", "PYTHONHASHSEED": "42", "SEED": "42"},
     )
-    metrics = parse_metrics(result.stdout)
+    parsed_metrics = parse_metrics(result.stdout)
     # Persistence-boundary guard: a degenerate refinement run must not be written
     # as a valid candidate metric (it would poison acceptance + diagnosis).
     metrics = metric_guard.guard_metrics(
-        metrics, result.duration_ms, context=f"phase2 refinement outer={n} inner={m}"
+        parsed_metrics, result.duration_ms, context=f"phase2 refinement outer={n} inner={m}"
     )
     probe_metrics = parse_probe_metrics(result.stdout)
     probe_rejection_reason = _probe_rejection_reason(probe_metrics)
@@ -484,7 +484,7 @@ def evaluate_and_update_fn(tool_context) -> str:
         diagnosis_report = {}
     prediction_verification = _verify_prediction_contract(
         diagnosis_report.get("prediction"),
-        metrics if run_ok else None,
+        metrics if run_ok else parsed_metrics,
     )
     tool_context.state["latest_prediction_verification"] = prediction_verification
     prediction_failed = prediction_verification.get("status") == "failed"

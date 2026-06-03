@@ -7,9 +7,7 @@ from google.adk.tools import FunctionTool
 from mle_star_agent import config
 from mle_star_agent.guards.code_validator_agent import code_validator_tool, store_validation_cache_tool
 from mle_star_agent.shared.callbacks import (
-    budget_stop_callback,
     count_tokens_callback,
-    log_context_size_callback,
     rate_limit_retry_callback,
 )
 from mle_star_agent.shared.checkpoint_io import checkpoint_exists, load_checkpoint
@@ -429,7 +427,6 @@ refinement_coder_agent = LlmAgent(
     tools=[_load_context_tool, _save_plan_tool, code_validator_tool, store_validation_cache_tool],
     output_key="current_script",
     include_contents="none",
-    before_model_callback=[log_context_size_callback, budget_stop_callback],
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )

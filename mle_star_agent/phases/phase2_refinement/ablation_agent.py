@@ -158,7 +158,7 @@ def _is_complete_ablation_results(results: list) -> bool:
         if (
             isinstance(r, dict)
             and r.get("variant_index") is not None
-            # skipped counts as present — it was a deliberate targeted decision, not a miss
+            and r.get("status") != "skipped"
         )
     }
     return seen == expected
