@@ -1,0 +1,751 @@
+import json as _json
+import logging
+import time
+
+from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.tools import FunctionTool
+
+from mle_star_agent import config
+from mle_star_agent.guards.code_validator_agent import code_validator_tool
+from mle_star_agent.shared import code_runner, metric_guard
+from mle_star_agent.shared.callbacks import (
+    budget_stop_callback,
+    count_tokens_callback,
+    log_context_size_callback,
+    rate_limit_retry_callback,
+)
+from mle_star_agent.shared.checkpoint_io import (
+    checkpoint_exists,
+    load_checkpoint,
+    save_checkpoint,
+)
+from mle_star_agent.shared.checkpoint_lineage import (
+    lineage_matches,
+    script_lineage,
+    stable_json_sha256,
+)
+from mle_star_agent.shared.metrics_parser import metrics_to_dict, parse_metrics
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Ablation variant definitions
+# ---------------------------------------------------------------------------
+
+ABLATION_VARIANTS = [
+    {
+        "name": "no_stereo_fusion",
+        "description": (
+            "Remove stereo fusion: use only the left (_L) image instead of combining "
+            "L and R images. Drop all code that loads or merges the _R image."
+        ),
+    },
+    {
+        "name": "no_weighted_loss",
+        "description": (
+            "Remove weighted loss: replace the class-weighted cross-entropy loss "
+            "with a standard unweighted cross-entropy loss."
+        ),
+    },
+    {
+        "name": "no_threshold_sweep",
+        "description": (
+            "Remove threshold sweep: use a fixed classification threshold of 0.5 "
+            "instead of sweeping thresholds on the validation set."
+        ),
+    },
+    {
+        "name": "no_augmentation",
+        "description": (
+            "Remove data augmentation: train without any augmentation transforms. "
+            "Apply only basic normalisation / resize."
+        ),
+    },
+    {
+        "name": "threshold_acceptance_probe",
+        "description": (
+            "Diagnostic threshold probe: keep the trained model architecture and data pipeline, "
+            "but replace any recall-only or F1-only threshold selection with validation-set "
+            "threshold selection that minimises acceptance distance. The threshold objective must "
+            "jointly consider miss_rate <= 0.03, ng_recall >= 0.97, overkill_rate <= 0.08, "
+            "and accuracy >= 0.92, with miss_rate as the first priority and overkill_rate as "
+            "the next practical gap to close."
+        ),
+    },
+    {
+        "name": "g_false_positive_penalty_probe",
+        "description": (
+            "Diagnostic G false-positive probe: keep stereo loading and threshold search, but "
+            "modify the loss, sampler, or validation selection so false positives on G samples "
+            "are explicitly penalised. The goal is to reduce overkill_rate without allowing "
+            "miss_rate to exceed 0.03."
+        ),
+    },
+    {
+        "name": "calibration_probe",
+        "description": (
+            "Diagnostic calibration probe: keep the same trained model family, but add validation "
+            "probability calibration before threshold selection, such as temperature scaling, "
+            "Platt/logistic calibration, or isotonic-style monotonic calibration implemented "
+            "locally. Use calibrated NG probabilities for the final threshold sweep."
+        ),
+    },
+    {
+        "name": "preprocessing_normalization_probe",
+        "description": (
+            "Diagnostic preprocessing probe: keep the model and loss strategy, but improve image "
+            "normalisation for AOI lighting/lot variation. Add robust per-image normalisation, "
+            "CLAHE or contrast normalisation, and ensure the same transform is applied to L/R "
+            "pairs without fitting preprocessing on validation or test data."
+        ),
+    },
+    {
+        "name": "training_schedule_probe",
+        "description": (
+            "Diagnostic training-schedule probe: keep the model family and data split, but change "
+            "the optimisation schedule to reduce unstable false rejects. Use a lower learning "
+            "rate or scheduler, weight decay, early stopping on acceptance distance, and restore "
+            "the best validation checkpoint before testing."
+        ),
+    },
+]
+
+NUM_ABLATION_VARIANTS = len(ABLATION_VARIANTS)
+
+TARGETED_ABLATION_VARIANTS = {
+    "threshold_collapse": {
+        "threshold_acceptance_probe",
+        "calibration_probe",
+        "g_false_positive_penalty_probe",
+        "no_threshold_sweep",
+    },
+    "g_ng_overlap": {
+        "no_stereo_fusion",
+        "g_false_positive_penalty_probe",
+        "preprocessing_normalization_probe",
+        "calibration_probe",
+    },
+    "preprocessing_lot_shift": {
+        "preprocessing_normalization_probe",
+        "no_augmentation",
+        "calibration_probe",
+        "training_schedule_probe",
+    },
+    "lot_shift_noise": {
+        "preprocessing_normalization_probe",
+        "no_augmentation",
+        "calibration_probe",
+        "training_schedule_probe",
+    },
+    "low_capacity_miss": {
+        "no_stereo_fusion",
+        "training_schedule_probe",
+        "no_weighted_loss",
+    },
+    "near_acceptance": {
+        "threshold_acceptance_probe",
+        "calibration_probe",
+        "g_false_positive_penalty_probe",
+    },
+}
+
+
+def _is_complete_ablation_results(results: list) -> bool:
+    expected = set(range(NUM_ABLATION_VARIANTS))
+    seen = {
+        int(r.get("variant_index"))
+        for r in results
+        if (
+            isinstance(r, dict)
+            and r.get("variant_index") is not None
+            # skipped counts as present — it was a deliberate targeted decision, not a miss
+        )
+    }
+    return seen == expected
+
+
+def _failure_mode_from_state(state: dict) -> tuple[str, str]:
+    diagnosis = state.get("diagnosis_brief") or {}
+    failure = diagnosis.get("failure_classification") or {}
+    if not isinstance(failure, dict):
+        return "", ""
+    return failure.get("failure_mode", ""), failure.get("confidence", "")
+
+
+def _targeted_variant_names_for_state(state: dict) -> set | None:
+    n = int(state.get("outer_iteration", 0))
+    if n <= 0:
+        return None
+
+    failure_mode, confidence = _failure_mode_from_state(state)
+    if not failure_mode or confidence == "low":
+        return None
+
+    names = TARGETED_ABLATION_VARIANTS.get(failure_mode)
+    if not names:
+        return None
+
+    names = set(names)
+    # Mono input: drop the stereo-fusion variant from the targeted set for
+    # g_ng_overlap / low_capacity_miss — it is not relevant (not a failure) for mono.
+    input_modality = state.get("input_modality", "stereo")
+    if input_modality == "mono":
+        names.discard("no_stereo_fusion")
+
+    diagnosis = state.get("diagnosis_brief") or {}
+    best_probe = diagnosis.get("best_probe") or {}
+    best_probe_name = best_probe.get("name")
+    if best_probe_name:
+        names.add(best_probe_name)
+    return names
+
+
+def _ablation_lineage(state: dict) -> dict:
+    lineage = script_lineage(
+        state.get("best_pipeline_script", ""),
+        script_key="best_pipeline_script_sha256",
+    )
+    lineage["ablation_variant_count"] = NUM_ABLATION_VARIANTS
+    lineage["ablation_variant_names_sha256"] = stable_json_sha256([
+        v["name"] for v in ABLATION_VARIANTS
+    ])
+    lineage["targeted_ablation_map_sha256"] = stable_json_sha256(TARGETED_ABLATION_VARIANTS)
+    return lineage
+
+
+def _is_ablation_checkpoint_current(data: dict, state: dict) -> bool:
+    return lineage_matches(data.get("lineage"), _ablation_lineage(state))
+
+# ---------------------------------------------------------------------------
+# Stop-flag checker (sub-agent 1 of ablation_agent)
+# Handles two concerns in one FunctionTool:
+#   (a) stop_outer_loop  → escalate to exit the outer LoopAgent
+#   (b) ablation checkpoint exists → pre-populate result keys so variant steps self-skip
+# ---------------------------------------------------------------------------
+
+
+def check_stop_flag_fn(tool_context) -> str:
+    """
+    1. If stop_outer_loop is True, set escalate = True to exit the outer LoopAgent.
+    2. Otherwise, if ablation_{{N}}.json exists for the current outer_iteration, load
+       it and pre-populate ablation_result_N keys so variant steps self-skip.
+    3. Otherwise signal CONTINUE.
+    """
+    if tool_context.state.get("stop_outer_loop", False):
+        tool_context.actions.escalate = True
+        return "STOP_FLAG_SET: stop_outer_loop is True — escalating to exit the outer loop."
+
+    n = int(tool_context.state.get("outer_iteration", 0))
+    ckpt_path = config.ckpt_ablation(n)
+    if checkpoint_exists(ckpt_path):
+        data = load_checkpoint(ckpt_path)
+        results = data.get("ablation_results", [])
+        if not _is_ablation_checkpoint_current(data, tool_context.state):
+            logger.warning("ablation_%d.json lineage mismatch — ignoring stale checkpoint.", n)
+            return (
+                f"CONTINUE: ablation_{n}.json lineage does not match current "
+                "best pipeline, data split, acceptance config, or ablation variant set — "
+                "proceeding with fresh/recovered run."
+            )
+        if not _is_complete_ablation_results(results):
+            logger.warning(
+                "ablation_%d.json has %d/%d variant results — ignoring incomplete checkpoint.",
+                n,
+                len(results),
+                NUM_ABLATION_VARIANTS,
+            )
+            return (
+                f"CONTINUE: ablation_{n}.json is incomplete "
+                f"({len(results)}/{NUM_ABLATION_VARIANTS}) — proceeding with recovery/fresh run."
+            )
+        tool_context.state["ablation_results"] = results
+        for r in results:
+            idx = r.get("variant_index", 0)
+            tool_context.state[f"ablation_result_{idx}"] = r
+        return (
+            f"CHECKPOINT_FOUND: loaded {len(results)} ablation result(s) for "
+            f"outer_iteration={n}. ablation_result_N keys pre-populated — "
+            "variant steps will self-skip."
+        )
+
+    return f"CONTINUE: no stop flag, no checkpoint for outer_iteration={n} — proceeding."
+
+
+check_stop_flag_tool = FunctionTool(func=check_stop_flag_fn)
+
+_FLAG_CHECKER_INSTRUCTION = """You are the Ablation Stop Flag Checker.
+
+Call `check_stop_flag_fn` immediately.
+- If it returns STOP_FLAG_SET: report that the outer loop is exiting and stop.
+- If it returns CHECKPOINT_FOUND: report how many results were loaded and stop.
+- If it returns CONTINUE: report that ablation will proceed and stop.
+
+Do not call any other tools.
+"""
+
+ablation_flag_checker = LlmAgent(
+    name="ablation_flag_checker",
+    model=config.MODEL,
+    description=(
+        "Checks stop_outer_loop flag (escalates if set) and ablation checkpoint "
+        "(pre-populates state if found). Must be the first step of ablation_agent."
+    ),
+    instruction=_FLAG_CHECKER_INSTRUCTION,
+    tools=[check_stop_flag_tool],
+    include_contents="none",
+    before_model_callback=log_context_size_callback,
+    after_model_callback=count_tokens_callback,
+    on_model_error_callback=rate_limit_retry_callback,
+)
+
+# ---------------------------------------------------------------------------
+# Shared script-fetch tool (avoids broadcasting full script into each variant agent's context)
+# ---------------------------------------------------------------------------
+
+
+def get_best_pipeline_script_fn(tool_context) -> str:
+    """
+    Fetch the current best pipeline script from state.
+    Call this at the start of STEP 2 to retrieve the script instead of reading it
+    from conversation context — this keeps the script out of the variant agents'
+    initial context and only loads it on demand.
+    """
+    script = tool_context.state.get("best_pipeline_script", "")
+    if not script:
+        return "ERROR: best_pipeline_script not found in state."
+    return f"BEST_PIPELINE_SCRIPT:\n{script}"
+
+
+get_best_pipeline_script_tool = FunctionTool(func=get_best_pipeline_script_fn)
+
+# ---------------------------------------------------------------------------
+# Per-variant FunctionTool factories
+# ---------------------------------------------------------------------------
+
+
+def _make_save_script_fn(variant_index: int):
+    def save_ablation_script_fn(tool_context, script: str) -> str:
+        tool_context.state[f"ablation_script_{variant_index}"] = script
+        return f"Variant {variant_index}: ablated script saved to state."
+
+    save_ablation_script_fn.__name__ = f"save_ablation_script_{variant_index}_fn"
+    save_ablation_script_fn.__doc__ = (
+        f"Save the ablated script text to state['ablation_script_{variant_index}'] "
+        "before validation and execution."
+    )
+    return save_ablation_script_fn
+
+
+def _make_run_variant_fn(variant_index: int):
+    variant_name = ABLATION_VARIANTS[variant_index]["name"]
+
+    def run_ablation_variant_fn(tool_context) -> str:
+        # Check state first (set by flag-checker from aggregated checkpoint)
+        existing = tool_context.state.get(f"ablation_result_{variant_index}")
+        if existing is not None:
+            return f"Variant {variant_index} ({variant_name}): already evaluated — skipping."
+
+        # Modality guard: the stereo-fusion ablation has no meaning for mono input
+        # (there is no _R image to drop). Write a "skipped" record — do NOT silently
+        # drop it, or aggregate completeness (set(range(NUM_ABLATION_VARIANTS))) breaks.
+        input_modality = tool_context.state.get("input_modality", "stereo")
+        if input_modality == "mono" and variant_name == "no_stereo_fusion":
+            result_dict = {
+                "variant_index": variant_index,
+                "name": variant_name,
+                "status": "skipped",
+                "reason": "stereo_ablation_not_relevant_for_mono",
+                "metrics": None,
+                "lineage": _ablation_lineage(tool_context.state),
+            }
+            tool_context.state[f"ablation_result_{variant_index}"] = result_dict
+            return (
+                f"Variant {variant_index} ({variant_name}): skipped "
+                "(mono input — stereo fusion ablation not relevant)."
+            )
+
+        # Targeted ablation: after iteration 0, only run variants relevant to
+        # the current deterministic failure classification. Skipped variants
+        # still get result records so aggregate completeness remains stable.
+        targeted_names = _targeted_variant_names_for_state(tool_context.state)
+        if targeted_names is not None and variant_name not in targeted_names:
+            result_dict = {
+                "variant_index": variant_index,
+                "name": variant_name,
+                "status": "skipped",
+                "reason": "targeted_ablation_skipped_not_relevant",
+                "metrics": None,
+                "lineage": _ablation_lineage(tool_context.state),
+            }
+            tool_context.state[f"ablation_result_{variant_index}"] = result_dict
+            return (
+                f"Variant {variant_index} ({variant_name}): skipped "
+                "(targeted ablation — not relevant to current failure mode)."
+            )
+
+        # Fallback adaptive skip for low-confidence/missing classifications.
+        n = int(tool_context.state.get("outer_iteration", 0))
+        if n > 0 and targeted_names is None:
+            diagnosis = tool_context.state.get("diagnosis_brief", {})
+            ranking = diagnosis.get("ablation_ranking", [])
+            removals = [r for r in ranking if not r.get("is_probe") and r.get("status") == "success"]
+            bottom_3_names = [r["name"] for r in removals[-3:]] if len(removals) >= 4 else []
+            if variant_name in bottom_3_names:
+                result_dict = {
+                    "variant_index": variant_index,
+                    "name": variant_name,
+                    "status": "skipped",
+                    "reason": "adaptive_ablation_skipped_low_impact",
+                    "metrics": None,
+                    "lineage": _ablation_lineage(tool_context.state),
+                }
+                tool_context.state[f"ablation_result_{variant_index}"] = result_dict
+                return f"Variant {variant_index} ({variant_name}): skipped (adaptive ablation — low impact in prior iteration)."
+
+        # Check per-variant checkpoint (survives crashes between variant runs and aggregation)
+        n = int(tool_context.state.get("outer_iteration", 0))
+        variant_ckpt = config.ckpt_ablation_variant(n, variant_index)
+        if checkpoint_exists(variant_ckpt):
+            result_dict = load_checkpoint(variant_ckpt)
+            if not lineage_matches(result_dict.get("lineage"), _ablation_lineage(tool_context.state)):
+                logger.warning(
+                    "Ignoring stale per-variant checkpoint for variant %d: lineage mismatch",
+                    variant_index,
+                )
+            else:
+                tool_context.state[f"ablation_result_{variant_index}"] = result_dict
+                logger.info("Loaded per-variant checkpoint for variant %d from %s", variant_index, variant_ckpt)
+                metrics = result_dict.get("metrics") or {}
+                return (
+                    f"Variant {variant_index} ({variant_name}): loaded from per-variant checkpoint — "
+                    f"ng_recall={metrics.get('ng_recall', 'N/A')}, miss_rate={metrics.get('miss_rate', 'N/A')}, "
+                    f"overkill_rate={metrics.get('overkill_rate', 'N/A')}, f1={metrics.get('f1', 'N/A')}, "
+                    f"threshold={metrics.get('threshold', 'N/A')}"
+                )
+
+        script = tool_context.state.get(f"ablation_script_{variant_index}", "")
+        if not script:
+            result_dict = {
+                "variant_index": variant_index,
+                "name": variant_name,
+                "status": "skipped",
+                "reason": "no ablated script found in state",
+                "metrics": None,
+                "lineage": _ablation_lineage(tool_context.state),
+            }
+            tool_context.state[f"ablation_result_{variant_index}"] = result_dict
+            return f"Variant {variant_index} ({variant_name}): no script in state — marked skipped."
+
+        logger.info("Running ablation variant %d: %s", variant_index, variant_name)
+        result = code_runner.run_script(script, timeout=config.TIMEOUT_SECONDS)
+        metrics = parse_metrics(result.stdout)
+        # Persistence-boundary guard: keep degenerate variant runs out of the
+        # ablation summary so impact scoring isn't computed against dummy probes.
+        metrics = metric_guard.guard_metrics(
+            metrics, result.duration_ms, context=f"phase2 ablation variant {variant_index}"
+        )
+
+        result_dict = {
+            "variant_index": variant_index,
+            "name": variant_name,
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "duration_ms": round(result.duration_ms, 1),
+            "stdout_tail": result.stdout[-3000:],
+            "stderr_tail": result.stderr[-1000:],
+            "metrics": metrics_to_dict(metrics) if metrics else None,
+            "status": "success" if (result.returncode == 0 and metrics is not None) else "failed",
+            "lineage": _ablation_lineage(tool_context.state),
+        }
+        tool_context.state[f"ablation_result_{variant_index}"] = result_dict
+
+        # Save per-variant checkpoint immediately so crashes don't redo this variant
+        config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        save_checkpoint(variant_ckpt, result_dict)
+        logger.info("Saved per-variant checkpoint: %s", variant_ckpt)
+
+        time.sleep(config.RATE_LIMIT_DELAY_SECONDS)
+
+        if metrics:
+            return (
+                f"Variant {variant_index} ({variant_name}): "
+                f"ng_recall={metrics.ng_recall:.3f}, miss_rate={metrics.miss_rate:.3f}, "
+                f"overkill_rate={metrics.overkill_rate:.3f}, "
+                f"f1={metrics.f1:.3f}, threshold={metrics.threshold}"
+            )
+        return (
+            f"Variant {variant_index} ({variant_name}): FAILED "
+            f"(rc={result.returncode}, timed_out={result.timed_out}). "
+            f"stderr: {result.stderr[-300:]}"
+        )
+
+    run_ablation_variant_fn.__name__ = f"run_ablation_variant_{variant_index}_fn"
+    run_ablation_variant_fn.__doc__ = (
+        f"Execute the ablated script for variant {variant_index} ({variant_name}) "
+        "and write results to state."
+    )
+    return run_ablation_variant_fn
+
+
+# ---------------------------------------------------------------------------
+# Per-variant step agents (sub-agents of ablation_sequential)
+# ---------------------------------------------------------------------------
+
+
+def _make_variant_step_agent(variant_index: int) -> LlmAgent:
+    variant = ABLATION_VARIANTS[variant_index]
+    variant_name = variant["name"]
+    variant_desc = variant["description"]
+
+    save_fn = _make_save_script_fn(variant_index)
+    save_tool = FunctionTool(func=save_fn)
+    run_fn = _make_run_variant_fn(variant_index)
+    run_tool = FunctionTool(func=run_fn)
+
+    instruction = f"""You are Ablation/Diagnostic Probe Step {variant_index}: **{variant_name}**.
+
+Change to apply: {variant_desc}
+
+---
+## STEP 1 — Check skip condition
+If `ablation_flag_checker` earlier reported "CHECKPOINT_FOUND" in its output,
+state["ablation_result_{variant_index}"] was already loaded from the checkpoint.
+In that case, report "Variant {variant_index} ({variant_name}): already evaluated — skipping."
+and stop immediately. Do NOT call any tools.
+
+If no CHECKPOINT_FOUND was reported, proceed to STEP 2.
+
+---
+
+---
+## STEP 2 — Generate diagnostic script
+Call `get_best_pipeline_script_fn` to retrieve the current best pipeline script.
+Using the script returned under "BEST_PIPELINE_SCRIPT:", generate a complete
+Python training script with exactly one diagnostic change: {variant_desc}
+
+Requirements for the diagnostic script:
+- Must define `ABLATION_VARIANT_NAME = "{variant_name}"` near the top of the script
+  so validator policy can distinguish diagnostic probes from normal candidates.
+- Must still print METRICS: {{...}} at the end with the standard keys
+  (accuracy, ng_recall, miss_rate, overkill_rate, f1, avg_latency_ms, threshold,
+   ng_count, g_count, tp, tn, fp, fn, roc_auc, prob_gap)
+  where roc_auc = sklearn.metrics.roc_auc_score(y_true_binary, ng_probs) on the test set
+  (1=NG, 0=G; emit 0.0 if only one class present), and
+  prob_gap = mean(ng_probs[true==NG]) - mean(ng_probs[true==G])
+- Must use the train/val/test split paths from state["data_split"]
+- Must load Excel labels
+- Must preserve all other components except for the single change specified above
+- If ablating stereo fusion (no_stereo_fusion): load only _L images; remove _R loading
+- If NOT ablating stereo fusion: continue loading both _L and _R images
+- If the variant name starts with `no_`, remove or disable only that component.
+- If the variant name ends with `_probe`, apply the specified diagnostic improvement
+  and compare whether it closes the current acceptance gaps, especially overkill_rate
+  and accuracy, without worsening miss_rate.
+
+---
+## STEP 3 — Save the diagnostic script
+Call `save_ablation_script_{variant_index}_fn` with the complete ablated script text.
+
+---
+## STEP 4 — Validate
+Call `code_validator_agent` with the script text to validate it.
+- If the response contains "VALIDATED_SCRIPT:": extract the corrected script.
+  - If corrected, call `save_ablation_script_{variant_index}_fn` with the corrected version.
+- If "VALIDATION_FAILED": proceed to STEP 5 anyway (run will record the failure).
+
+---
+## STEP 5 — Execute
+Call `run_ablation_variant_{variant_index}_fn`. It reads the saved script from state,
+executes it, parses METRICS, and writes state["ablation_result_{variant_index}"].
+
+---
+## STEP 6 — Report
+Report the key metrics (ng_recall, miss_rate, overkill_rate, f1, threshold) or the
+error summary if execution failed.
+"""
+
+    return LlmAgent(
+        name=f"ablation_step_{variant_index}_{variant_name}",
+        model=config.MODEL_PRO,
+        description=f"Generates, validates, and runs ablation variant {variant_index}: {variant_name}.",
+        instruction=instruction,
+        tools=[get_best_pipeline_script_tool, save_tool, run_tool, code_validator_tool],
+        include_contents="none",
+        before_model_callback=[log_context_size_callback, budget_stop_callback],
+        after_model_callback=count_tokens_callback,
+        on_model_error_callback=rate_limit_retry_callback,
+    )
+
+
+_variant_step_agents = [_make_variant_step_agent(i) for i in range(NUM_ABLATION_VARIANTS)]
+
+# ---------------------------------------------------------------------------
+# ablation_sequential: run one variant at a time to avoid CPU/API contention
+# ---------------------------------------------------------------------------
+
+ablation_sequential = SequentialAgent(
+    name="ablation_sequential",
+    description="Generates and evaluates ablation variants one at a time; each variant writes to its own state key.",
+    sub_agents=_variant_step_agents,
+)
+
+# ---------------------------------------------------------------------------
+# Aggregator FunctionTool
+# ---------------------------------------------------------------------------
+
+
+def consolidate_ablation_results_fn(tool_context) -> str:
+    """
+    Collect all ablation_result_N keys from state, write state["ablation_results"],
+    save checkpoints/ablation_{{N}}.json, and return a JSON summary.
+    If the checkpoint already exists (pre-loaded by flag checker), confirm without re-saving.
+    """
+    n = int(tool_context.state.get("outer_iteration", 0))
+    ckpt_path = config.ckpt_ablation(n)
+
+    # If results already in state from checkpoint, just confirm
+    # Guard: treat an empty checkpoint (saved during a crash) as non-existent
+    pre_loaded = tool_context.state.get("ablation_results", [])
+    if (
+        checkpoint_exists(ckpt_path)
+        and pre_loaded
+        and _is_complete_ablation_results(pre_loaded)
+    ):
+        aggregate = load_checkpoint(ckpt_path)
+        if not _is_ablation_checkpoint_current(aggregate, tool_context.state):
+            pre_loaded = []
+            tool_context.state["ablation_results"] = []
+        else:
+            results = pre_loaded
+            successful = sum(1 for r in results if r.get("status") == "success")
+            summary = [
+                {
+                    "name": r.get("name"),
+                    "status": r.get("status"),
+                    "ng_recall": (r.get("metrics") or {}).get("ng_recall"),
+                    "miss_rate": (r.get("metrics") or {}).get("miss_rate"),
+                    "overkill_rate": (r.get("metrics") or {}).get("overkill_rate"),
+                    "f1": (r.get("metrics") or {}).get("f1"),
+                    "threshold": (r.get("metrics") or {}).get("threshold"),
+                }
+                for r in results
+            ]
+            return (
+                f"CHECKPOINT_EXISTS: ablation_{n}.json already saved with "
+                f"{len(results)} result(s) ({successful} successful).\n\n"
+                f"ABLATION_RESULTS:\n{_json.dumps(summary, indent=2)}"
+            )
+
+    # Before collecting, recover any variants that ran but weren't loaded into state
+    # (happens when flag-checker loaded an incomplete aggregate checkpoint, or on crash
+    # between a variant completing and the aggregate being written)
+    for i in range(NUM_ABLATION_VARIANTS):
+        if tool_context.state.get(f"ablation_result_{i}") is None:
+            variant_ckpt = config.ckpt_ablation_variant(n, i)
+            if checkpoint_exists(variant_ckpt):
+                result_dict = load_checkpoint(variant_ckpt)
+                if lineage_matches(result_dict.get("lineage"), _ablation_lineage(tool_context.state)):
+                    tool_context.state[f"ablation_result_{i}"] = result_dict
+                    logger.info("Late-loaded per-variant checkpoint for variant %d", i)
+                else:
+                    logger.warning("Ignoring stale per-variant checkpoint for variant %d", i)
+
+    # Collect fresh results from per-variant state keys
+    results = []
+    for i in range(NUM_ABLATION_VARIANTS):
+        r = tool_context.state.get(f"ablation_result_{i}")
+        if r is not None:
+            results.append(r)
+
+    tool_context.state["ablation_results"] = results
+
+    if not _is_complete_ablation_results(results):
+        missing = sorted(
+            set(range(NUM_ABLATION_VARIANTS))
+            - {
+                int(r.get("variant_index"))
+                for r in results
+                if isinstance(r, dict) and r.get("variant_index") is not None
+            }
+        )
+        return (
+            f"INCOMPLETE_ABLATION_RESULTS: collected {len(results)}/{NUM_ABLATION_VARIANTS}; "
+            f"missing variant indices {missing}. Not saving aggregate checkpoint."
+        )
+
+    config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    save_checkpoint(ckpt_path, {
+        "outer_iteration": n,
+        "lineage": _ablation_lineage(tool_context.state),
+        "ablation_results": results,
+    })
+
+    successful = sum(1 for r in results if r.get("status") == "success")
+    summary = [
+        {
+            "name": r.get("name"),
+            "status": r.get("status"),
+            "ng_recall": (r.get("metrics") or {}).get("ng_recall"),
+            "miss_rate": (r.get("metrics") or {}).get("miss_rate"),
+            "overkill_rate": (r.get("metrics") or {}).get("overkill_rate"),
+            "f1": (r.get("metrics") or {}).get("f1"),
+            "threshold": (r.get("metrics") or {}).get("threshold"),
+        }
+        for r in results
+    ]
+    return (
+        f"Aggregated {len(results)} ablation result(s) ({successful} successful) "
+        f"for outer_iteration={n}. Saved to ablation_{n}.json.\n\n"
+        f"ABLATION_RESULTS:\n{_json.dumps(summary, indent=2)}"
+    )
+
+
+_consolidate_tool = FunctionTool(func=consolidate_ablation_results_fn)
+
+_AGGREGATOR_INSTRUCTION = """You are the Ablation Aggregator Agent.
+
+Steps:
+1. Call `consolidate_ablation_results_fn`. It collects all variant results,
+   saves the checkpoint, and returns an ABLATION_RESULTS JSON block.
+2. Using the ABLATION_RESULTS data returned by the tool, produce a summary table:
+   Variant | Type | Status | ng_recall | miss_rate | overkill_rate | accuracy | f1 | threshold
+3. Compare each ablated variant against the baseline (state["current_best_score"]).
+   For `no_*` variants, identify component removals that cause the biggest acceptance
+   regression. For `*_probe` variants, identify changes that reduce the dominant
+   acceptance gaps, especially overkill_rate and accuracy, while preserving miss_rate.
+4. Clearly state the recommended target component for the diagnosis agent. Prefer the
+   target most likely to move the pipeline toward all relaxed acceptance thresholds,
+   not the target with the highest ng_recall alone.
+
+Do not write any additional state keys — `consolidate_ablation_results_fn` handles all writes.
+"""
+
+ablation_aggregator_agent = LlmAgent(
+    name="ablation_aggregator_agent",
+    model=config.MODEL,
+    description=(
+        "Consolidates per-variant ablation results into state['ablation_results'] "
+        "and saves checkpoints/ablation_{{N}}.json."
+    ),
+    instruction=_AGGREGATOR_INSTRUCTION,
+    tools=[_consolidate_tool],
+    include_contents="none",
+    before_model_callback=log_context_size_callback,
+    after_model_callback=count_tokens_callback,
+    on_model_error_callback=rate_limit_retry_callback,
+)
+
+# ---------------------------------------------------------------------------
+# ablation_agent: top-level SequentialAgent (sub-agent of outer LoopAgent)
+# ---------------------------------------------------------------------------
+
+ablation_agent = SequentialAgent(
+    name="ablation_agent",
+    description=(
+        "Phase 2 ablation: for each outer iteration, disables one pipeline component "
+        "at a time to identify which contributes most to performance. Writes "
+        "state['ablation_results'] and checkpoints/ablation_{{N}}.json. "
+        "Exits the outer LoopAgent immediately if stop_outer_loop is True."
+    ),
+    sub_agents=[ablation_flag_checker, ablation_sequential, ablation_aggregator_agent],
+)

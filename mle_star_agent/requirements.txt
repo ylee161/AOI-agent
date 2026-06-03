@@ -1,0 +1,14 @@
+google-adk==2.1.0
+litellm>=1.40.0,<2.0.0
+python-dotenv
+Pillow
+opencv-python-headless
+pandas
+openpyxl
+scikit-learn
+torch
+torchvision
+albumentations
+optuna
+numpy
+httpx

@@ -1,0 +1,26 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ADK runtime / agent state
+.adk/
+checkpoints/
+workspace/
+
+# Generated artifacts / data (bring your own dataset — see README)
+*.pth
+*.pt
+*.bmp
+*.png
+data/
+data_split/
+
+# OS
+.DS_Store
