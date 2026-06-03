@@ -820,6 +820,26 @@ Known failed strategy fingerprints are banned before candidate selection:
 - (`stereo_fusion`, `global_feature_difference_only`) — mg8 global feature-difference-only hurt.
 - (`stereo_fusion`, `two_independent_backbone_stereo`) — two-independent-backbone stereo adds capacity and overfits.
 - (`model_architecture`, `larger_backbone`) — larger backbone is the wrong lever for ~287 train samples.
+- (`augmentation`, `roi_geometric_augmentation`) — DEAD END (MG11). Every form of
+  geometric augmentation applied to the ROI crop collapses prob_gap below 0.10
+  (v3_roi_centered_aug: val prob_gap 0.058). The signal is too weak to survive
+  even mild spatial distortion. Do NOT propose random crop, rotation, flip,
+  perspective, affine, or any spatial transform targeted at the ROI region.
+  AOI-safe augmentations (applied identically to L and R globally) are still
+  allowed; ROI-specific geometric aug is not.
+- (`model_architecture`, `anomaly_detector`) — DEAD END (MG15/MG16). The
+  training-free per-board anomaly detector route (isolation forest, one-class SVM,
+  SVDD, autoencoder anomaly score, etc.) appeared to reach 0.78 AUC but this was
+  a board-pooling evaluation leak. Clean held-out AUC was 0.50 (random) with 83%
+  overkill. This entire family — any approach that treats defect detection as an
+  anomaly / out-of-distribution problem without supervised labels — is a dead end
+  on this dataset. Do NOT propose it under any reframing.
+- (`model_architecture`, `local_patch_mil`) — DEAD END (MG14). The
+  local-patch / multiple-instance-learning route (sliding-window patch scores,
+  MIL aggregation, patch-level supervision) reached AUC 0.45 (worse than random)
+  with 98% overkill. With only ~287 grouped training samples, there is not enough
+  data to learn a useful patch-level discriminator. Do NOT propose local patch
+  extraction, MIL bags, patch scoring heads, or sliding-window inference.
 - full-freeze-only is not banned globally, but if prior evidence shows flat
   predictions or `prob_gap` collapse around 0.02, treat it as underfit and select
   partial-unfreeze of the final ResNet block/layer4 instead.
