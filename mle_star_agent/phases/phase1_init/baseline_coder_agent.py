@@ -262,10 +262,13 @@ Each sample dict has: `sample_id` (str), the image path(s) for this dataset's in
    ```
 
    **Do NOT** filter out thresholds with `FP <= 2` as a hard gate — it silently falls back to a min-miss-rate policy when no threshold survives, which produces catastrophic overkill. The acceptance-distance fallback above handles the no-passing-threshold case with a balanced tradeoff.
+
+   **Probability calibration before the sweep**: after training, fit `sklearn.isotonic.IsotonicRegression(out_of_bounds="clip")` on the VALIDATION scores (`X = raw_val_ng_scores`, `y = val_true_binary` with 1=NG, 0=G), then map all val/test scores through the fitted calibrator (`cal_probs = iso.transform(raw_scores)`) so every probability is on the calibrated [0,1] scale. Run the acceptance-distance sweep above on these CALIBRATED probabilities (the sweep already steps 0.01, finer than 0.05). The THRESHOLD_CURVE, the final test metrics, and the reported `threshold` MUST all be computed on the calibrated probabilities — never the raw scores. Labels are binary G/NG only (no defect sub-classes), so this is a single global calibrator and a single global threshold.
 5. **METRICS output**: the last thing the script prints to stdout must be exactly:
    ```
    METRICS: {{"accuracy": ..., "ng_recall": ..., "miss_rate": ..., "overkill_rate": ..., "f1": ..., "avg_latency_ms": ..., "threshold": ..., "ng_count": ..., "g_count": ..., "tp": ..., "tn": ..., "fp": ..., "fn": ..., "roc_auc": ..., "prob_gap": ...}}
    ```
+   `threshold` is a single float and MUST be the selected operating point on the CALIBRATED-probability scale (the isotonic calibrator's output), not the raw score scale.
    Compute all metrics on the **test split** using the best threshold from the val sweep.
    - `roc_auc`: `sklearn.metrics.roc_auc_score(y_true, ng_probs)` on the test set (y_true=1 for NG, 0 for G). If only one class present in test, emit 0.0.
    - `prob_gap`: `mean(ng_probs where true_label==NG) - mean(ng_probs where true_label==G)`. Positive = good separation; near 0 or negative = overlap problem.

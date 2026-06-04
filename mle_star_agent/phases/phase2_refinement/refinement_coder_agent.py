@@ -409,6 +409,20 @@ The script must:
   with the lowest overkill_rate (P2 target: <= 0.08).
   Do NOT use acceptance-distance averaging or a blended score — this blurs the
   P0/P2 priority order. Miss_rate must be resolved first, then overkill minimised.
+- **Probability calibration before the sweep** (MANDATORY): after training, fit
+  `sklearn.isotonic.IsotonicRegression(out_of_bounds="clip")` on the VALIDATION
+  scores (`X = raw_val_ng_scores`, `y = val_true_binary` with 1=NG, 0=G), then map
+  all val/test scores through the fitted calibrator
+  (`cal_probs = iso.transform(raw_scores)`) so every probability is on the
+  calibrated [0,1] scale. The two-stage threshold selection above, the
+  THRESHOLD_CURVE, the final test metrics, and the `threshold` reported in METRICS
+  MUST ALL be computed on these CALIBRATED probabilities — never the raw scores.
+  Labels are binary G/NG only; there are no defect sub-classes, so this is a single
+  global calibrator and a single global threshold.
+- **Fine-grained sweep step** (MANDATORY): sweep the threshold across 0.10–0.90
+  inclusive at step **0.01** (not 0.05) — `[round(0.10 + 0.01 * i, 2) for i in range(81)]`.
+  The finer grid lets selection land on operating points (e.g. 0.37) the old 0.05
+  grid skipped, which is how miss_rate is pushed toward the <= 0.03 target.
 - When overkill remains high, add AOI-specific separability improvements before another
   generic backbone swap: ROI/contrast normalization, L/R alignment checks, absolute
   difference maps, SSIM-like difference features, local defect patches, probability
@@ -433,6 +447,9 @@ The script must:
   "overkill_rate": ..., "f1": ..., "avg_latency_ms": ..., "threshold": ...,
   "ng_count": ..., "g_count": ..., "tp": ..., "tn": ..., "fp": ..., "fn": ...,
   "roc_auc": ..., "prob_gap": ...}
+  `threshold` is a single float and MUST be the selected operating point on the
+  CALIBRATED-probability scale (the output of the isotonic calibrator), not the raw
+  score scale.
   where `roc_auc = sklearn.metrics.roc_auc_score(y_true_binary, ng_probs)` on the test set
   (y_true_binary: 1=NG, 0=G; emit 0.0 if only one class present), and
   `prob_gap = mean(ng_probs[true==NG]) - mean(ng_probs[true==G])` (positive = good separability)
