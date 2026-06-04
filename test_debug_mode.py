@@ -47,21 +47,61 @@ def test_debug_timeout_capped_at_config_value():
 
 def test_debug_patches_do_not_mutate_original_script():
     """apply_debug_patches returns a new string; the input is untouched."""
+    cap = config.CURVE_ABORT_DEBUG_EPOCHS
     original = "num_epochs = 50\nloader = DataLoader(train_ds, batch_size=32)\n"
     snapshot = original
     patched = code_runner.apply_debug_patches(original)
 
     assert original == snapshot, "original script string must not be mutated"
-    assert "num_epochs = 1" in patched, "epoch value should be forced to 1"
+    assert f"num_epochs = {cap}" in patched, "epoch value should be forced to the debug cap"
     assert "__aoi_cap5(train_ds)" in patched, "DataLoader arg should be capped"
     assert "num_epochs = 50" not in patched
 
 
 def test_epoch_regex_preserves_variable_name():
     """Epoch rewrite keeps the LHS name and only changes the integer literal."""
+    cap = config.CURVE_ABORT_DEBUG_EPOCHS
     patched = code_runner.apply_debug_patches("EPOCHS = 20\nmax_epochs=7\n")
-    assert "EPOCHS = 1" in patched
-    assert "max_epochs=1" in patched
+    assert f"EPOCHS = {cap}" in patched
+    assert f"max_epochs={cap}" in patched
+
+
+def test_dry_run_ternary_epochs_are_capped():
+    """The mandated `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20` form (which the
+    coder agents emit verbatim) must have its full-run `else` literal capped — the
+    debug run does not set DRY_RUN, so otherwise it would run the full 20 epochs."""
+    cap = config.CURVE_ABORT_DEBUG_EPOCHS
+    patched = code_runner.apply_debug_patches(
+        "epochs = DRY_RUN_EPOCHS if DRY_RUN else 20\n"
+    )
+    assert f"else {cap}" in patched
+    assert "else 20" not in patched
+    # the DRY_RUN_EPOCHS reference itself is untouched
+    assert "DRY_RUN_EPOCHS if DRY_RUN" in patched
+
+
+def test_scheduler_and_counter_epoch_vars_are_not_clobbered():
+    """warmup/patience/best/counter epoch vars are NOT training lengths — forcing
+    them to the cap would corrupt scheduler semantics and fake a learning curve."""
+    src = (
+        "warmup_epochs = 5\n"
+        "patience_epochs = 3\n"
+        "best_epoch = 0\n"
+        "epochs_done = 0\n"
+    )
+    patched = code_runner.apply_debug_patches(src)
+    assert "warmup_epochs = 5" in patched
+    assert "patience_epochs = 3" in patched
+    assert "best_epoch = 0" in patched
+    assert "epochs_done = 0" in patched
+
+
+def test_epoch_literal_with_exponent_is_replaced_whole():
+    """A scientific-notation literal must be replaced entirely, not leave `e3`."""
+    cap = config.CURVE_ABORT_DEBUG_EPOCHS
+    patched = code_runner.apply_debug_patches("num_epochs = 1e3\n")
+    assert f"num_epochs = {cap}" in patched
+    assert "e3" not in patched
 
 
 def test_debug_predict_thresholds_are_conservative():

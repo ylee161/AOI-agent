@@ -10,6 +10,9 @@ from mle_star_agent.shared.callbacks import count_tokens_callback, rate_limit_re
 from mle_star_agent.shared.difference_feature_validator import (
     validate_difference_feature_source,
 )
+from mle_star_agent.shared.lr_schedule_validator import (
+    validate_lr_schedule_source,
+)
 from mle_star_agent.shared.small_data_strategy_validator import (
     validate_small_data_strategy_source,
 )
@@ -116,6 +119,11 @@ def static_degenerate_threshold_guard_check_fn(script: str) -> dict:
     }
 
 
+def static_lr_schedule_check_fn(script: str) -> dict:
+    """AST/static check that generated scripts use and step an LR scheduler."""
+    return validate_lr_schedule_source(script)
+
+
 # Markers a candidate uses to opt into the feature-level Siamese difference family.
 # The marker only ROUTES to the structural check below; the check itself is AST-based
 # on the actual model code, not on the presence of these strings.
@@ -182,6 +190,7 @@ run_script_tool = FunctionTool(func=run_script_fn)
 static_contract_check_tool = FunctionTool(func=static_contract_check_fn)
 static_fp_penalty_check_tool = FunctionTool(func=static_fp_penalty_check_fn)
 static_degenerate_threshold_guard_check_tool = FunctionTool(func=static_degenerate_threshold_guard_check_fn)
+static_lr_schedule_check_tool = FunctionTool(func=static_lr_schedule_check_fn)
 static_difference_feature_check_tool = FunctionTool(func=static_difference_feature_check_fn)
 static_small_data_strategy_check_tool = FunctionTool(func=static_small_data_strategy_check_fn)
 static_data_usage_check_tool = FunctionTool(func=static_data_usage_check_fn)
@@ -241,6 +250,24 @@ Read the script and verify:
    miss_rate protection (P0) must always be resolved before overkill reduction (P2).
 
 If the script violates either rule, rewrite it before proceeding.
+
+---
+## CHECK 2B1 — Mandatory Learning-Rate Schedule (Static Analysis, no execution)
+
+Call `static_lr_schedule_check_fn` with the script. This is a HARD gate.
+
+Every non-probe training script must construct a real PyTorch learning-rate schedule
+and call `scheduler.step()` correctly in the training loop. A fixed learning rate is
+invalid because AOI candidates have been stalling on plateaus.
+
+Acceptable schedules include:
+- `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts` (SGDR), stepped once per
+  epoch or batch with the appropriate fractional epoch value;
+- `torch.optim.lr_scheduler.ReduceLROnPlateau`, stepped after validation with
+  `scheduler.step(val_loss)` or the validation metric it monitors.
+
+If the report's `ok` is False, rewrite the script before execution. Do NOT proceed
+to dry-run execution with a schedule-less script.
 
 ---
 ## CHECK 2B2 — Dynamic FP Penalty for High-Overkill Refinements
@@ -488,6 +515,7 @@ code_validator_agent = LlmAgent(
         static_contract_check_tool,
         static_fp_penalty_check_tool,
         static_degenerate_threshold_guard_check_tool,
+        static_lr_schedule_check_tool,
         static_difference_feature_check_tool,
         static_small_data_strategy_check_tool,
         static_data_usage_check_tool,

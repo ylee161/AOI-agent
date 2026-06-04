@@ -812,6 +812,7 @@ class InnerStagnationPolicyTests(unittest.TestCase):
                     "best_f1": 0.65,
                     "no_improve_count": 4,
                     "token_count": 0,
+                    "warm_restart_attempted_best_e3b0c442": True,
                     "refinement_plan": {
                         "target_component": "calibration",
                         "changes_summary": "no metric movement",

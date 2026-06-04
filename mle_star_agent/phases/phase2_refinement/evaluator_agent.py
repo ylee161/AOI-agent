@@ -46,14 +46,34 @@ from mle_star_agent.shared.diagnosis_scorer import (
     parse_threshold_curve,
     detect_early_collapse,
 )
+from mle_star_agent.shared.curve_extrapolation import project_power_law
 from mle_star_agent.phases.phase2_refinement.ideator_agent import trigger_ideation
-from mle_star_agent.phases.phase2_refinement import fusion
+from mle_star_agent.phases.phase2_refinement import fusion, warm_restart
 
 logger = logging.getLogger(__name__)
+
+OPTIMIZER_LR_SCHEDULE_TARGET = "optimizer/lr-schedule"
+_TARGET_COMPONENT_ALIASES = {
+    "optimizer_lr_schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "optimizer lr schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "lr_schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "lr-schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "training_schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _normalise_target_component(target_component: str) -> str:
+    target = (target_component or "unknown").strip().lower()
+    return _TARGET_COMPONENT_ALIASES.get(target, target)
+
+
+def _attempt_label(target_component: str, fingerprint: dict | None) -> str:
+    target = _normalise_target_component(target_component)
+    mechanism = ((fingerprint or {}).get("mechanism_class") or "unknown").strip().lower()
+    return f"{target}:{mechanism}"
 
 def _save_best_pipeline(state: dict) -> None:
     """Persist the authoritative resume snapshot to best_pipeline.json."""
@@ -534,6 +554,75 @@ def evaluate_and_update_fn(tool_context) -> str:
             f"inner_iteration now {m_next}, no_improve_count now {no_improve}."
         )
 
+    # ---- curve-abort: extrapolate the SHORT debug learning-curve and prune the
+    # full run ONLY when its projected final is CONFIDENTLY worse than the current
+    # best. The debug micro-run now emits config.CURVE_ABORT_DEBUG_EPOCHS epochs on
+    # 5% data (same 120s cap), so we have a per-epoch val_ng_recall curve. We fit a
+    # saturating power-law and prune only when the projection is trustworthy
+    # (fit_quality >= CURVE_ABORT_MIN_FIT) AND clearly below the best NG recall seen
+    # so far (by CURVE_ABORT_MARGIN). Safe-by-default: too few / poor-fit points, or
+    # no established baseline (best NG recall ~0 before any successful full run),
+    # never prune — borderline and early candidates fall through to the full run.
+    # A 5%-data short curve under-shoots the full-data plateau, hence the margin.
+    epoch_curve = (smoke_record.get("diagnostics") or {}).get("epoch_logs") or []
+    ng_recall_series = [
+        e.get("val_ng_recall")
+        for e in epoch_curve
+        if isinstance(e, dict) and e.get("val_ng_recall") is not None
+    ]
+    projected_ng_recall, curve_fit = project_power_law(ng_recall_series)
+    best_ng_recall = max(0.0, 1.0 - current_best_miss)
+    if (
+        projected_ng_recall is not None
+        and curve_fit >= config.CURVE_ABORT_MIN_FIT
+        and projected_ng_recall < best_ng_recall - config.CURVE_ABORT_MARGIN
+    ):
+        logger.warning(
+            "Curve abort pruned (outer=%d, inner=%d): projected ng_recall=%.3f "
+            "(fit=%.2f) below best ng_recall=%.3f by > margin %.2f — skipping full run",
+            n, m, projected_ng_recall, curve_fit, best_ng_recall,
+            config.CURVE_ABORT_MARGIN,
+        )
+        m_next = m + 1
+        tool_context.state["inner_iteration"] = m_next
+        no_improve += 1
+        tool_context.state["no_improve_count"] = no_improve
+
+        config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        attempt_data = {
+            "outer_iteration": n,
+            "inner_iteration": m_next,
+            "returncode":      debug_result.returncode,
+            "timed_out":       debug_result.timed_out,
+            "duration_ms":     round(debug_result.duration_ms, 1),
+            "improved":        False,
+            "failure_reason":  "curve_abort_projected_low_utility",
+            "new_score":       0.0,
+            "new_overkill":    1.0,
+            "current_best_score":   float(tool_context.state.get("current_best_score", 0.0)),
+            "current_best_overkill": float(tool_context.state.get("best_overkill_rate", 1.0)),
+            "no_improve_count":   no_improve,
+            "metrics":         None,
+            "smoke_metrics":    smoke_record["metrics"],
+            "smoke_score":      smoke_record["score"],
+            "smoke_diagnostics": smoke_record["diagnostics"],
+            "projected_ng_recall": round(float(projected_ng_recall), 4),
+            "curve_fit_quality":   round(float(curve_fit), 4),
+            "full_run_executed": False,
+            "full_run_reason":  "curve_abort_projected_low",
+            "stdout_tail":     debug_result.stdout[-3000:],
+            "stderr_tail":     debug_result.stderr[-1000:],
+        }
+        save_checkpoint(config.ckpt_refinement(n, m), attempt_data)
+        return (
+            f"CURVE ABORT PRUNED (outer={n}, inner={m}): debug learning-curve "
+            f"projects final ng_recall={projected_ng_recall:.3f} "
+            f"(fit_quality={curve_fit:.2f} >= {config.CURVE_ABORT_MIN_FIT}), "
+            f"confidently below best ng_recall={best_ng_recall:.3f} by more than "
+            f"margin {config.CURVE_ABORT_MARGIN}; full run skipped. "
+            f"inner_iteration now {m_next}, no_improve_count now {no_improve}."
+        )
+
     # ---- execute the script ----
     logger.info("Evaluator running script (outer=%d, inner=%d)", n, m)
     result = code_runner.run_script(
@@ -738,12 +827,20 @@ def evaluate_and_update_fn(tool_context) -> str:
         "accuracy": round(float(metrics.accuracy), 4) if metrics else 0.0,
         "improved": improved,
     }
+    selected_fingerprint = tool_context.state.get("selected_strategy_fingerprint") or {}
+    target_component = _normalise_target_component(plan.get("target_component", "unknown"))
+    if selected_fingerprint:
+        selected_fingerprint = dict(selected_fingerprint)
+        selected_fingerprint["target_component"] = _normalise_target_component(
+            selected_fingerprint.get("target_component", target_component)
+        )
     tried.append({
         "outer": n, "inner": m,
-        "target_component": plan.get("target_component", "unknown"),
+        "target_component": target_component,
         "changes_summary": plan.get("changes_summary", ""),
         "selected_strategy": selected_strategy,
-        "strategy_fingerprint": tool_context.state.get("selected_strategy_fingerprint"),
+        "strategy_fingerprint": selected_fingerprint,
+        "attempt_label": _attempt_label(target_component, selected_fingerprint),
         "result": result_dict,
         "prediction_verification": prediction_verification,
         "failure_reason": failure_reason,
@@ -856,7 +953,29 @@ def evaluate_and_update_fn(tool_context) -> str:
         )
 
     # ---- Priority 1b: below-relaxed inner stagnation restart ----
-    if loop_guard.should_restart_inner_for_stagnation(tool_context.state):
+    warm_restart_failed = (
+        not improved
+        and warm_restart.is_warm_restart_fingerprint(
+            tool_context.state.get("selected_strategy_fingerprint")
+        )
+    )
+    stagnated = loop_guard.should_restart_inner_for_stagnation(tool_context.state)
+    if stagnated and not warm_restart_failed:
+        warm_restart_status = warm_restart.arm_warm_restart_if_eligible(tool_context.state)
+        if warm_restart_status.startswith("WARM_RESTART_ARMED"):
+            tool_context.state["no_improve_count"] = 0
+            _save_best_pipeline(tool_context.state)
+            logger.info(
+                "Inner stagnation hit below relaxed acceptance — armed warm restart."
+            )
+            return (
+                f"{summary_prefix}\n"
+                f"{warm_restart_status}\n"
+                "CONTINUE: warm-restart refinement armed; inner loop will try it "
+                "before ideation or approach abandonment."
+            )
+
+    if stagnated or warm_restart_failed:
         n_next = n + 1
         # Cross-branch fusion arming (MCGS Evolution/Fusion): when the archive holds
         # >=2 diverse members, arm a fusion attempt for the upcoming outer cycle so
@@ -880,8 +999,14 @@ def evaluate_and_update_fn(tool_context) -> str:
             "Inner stagnation hit below relaxed acceptance — restarting at outer=%d.",
             n_next,
         )
+        warm_restart_line = (
+            "WARM_RESTART_FAILED: bounded warm-restart attempt did not improve; "
+            "falling through to existing ideation/restart path.\n"
+            if warm_restart_failed else ""
+        )
         return (
             f"{summary_prefix}\n"
+            f"{warm_restart_line}"
             f"INNER_STAGNATION: no improvement for "
             f"{config.INNER_STAGNATION_MAX_UNCONSTRAINED} below-relaxed attempts. "
             f"outer_iteration advanced to {n_next}, inner_iteration reset to 0, "

@@ -100,6 +100,22 @@ PROBE_PROBABILITY_GAP_MIN = 0.05  # require NG mean probability to exceed G mean
 # run the full job (absence of parseable METRICS on 5% data is NOT evidence of a bad script).
 DEBUG_PREDICT_OVERKILL_MAX = 0.60   # abort only if the micro-run already false-rejects most G
 DEBUG_PREDICT_NG_RECALL_MIN = 0.50  # abort only on severe NG-recall collapse
+
+# Power-law learning-curve extrapolation ("curve abort"). Builds ON TOP of the
+# egregious DEBUG_PREDICT_* gate above: instead of judging one noisy epoch, we let
+# the debug micro-run emit a SHORT curve (CURVE_ABORT_DEBUG_EPOCHS epochs on 5%
+# data, same 120s cap) and fit a saturating power-law y = a + b * t^(-c) to the
+# per-epoch val_ng_recall. We prune the full run ONLY when the projected final `a`
+# is CONFIDENTLY worse than the best NG recall so far (by CURVE_ABORT_MARGIN) AND
+# the fit is trustworthy (fit_quality >= CURVE_ABORT_MIN_FIT). Safe-by-default:
+# too few points, a poor/degenerate fit, or no established baseline => never prune
+# (the candidate falls through to the full run). A 5%-data short curve under-shoots
+# the full-data plateau, so these gates stay deliberately conservative.
+CURVE_ABORT_MIN_EPOCHS   = 3     # need >= this many per-epoch points to attempt a fit
+CURVE_ABORT_DEBUG_EPOCHS = 4     # epoch cap for the debug micro-run (was 1) so it emits a curve
+CURVE_ABORT_MARGIN       = 0.05  # projected final must be worse than the best by at least this
+CURVE_ABORT_MIN_FIT      = 0.70  # min fit_quality (R^2 in [0,1]) required to trust the projection
+
 PHASE1_SMOKE_TOP_K = 2  # full-run the top smoke-ranked initial candidates
 PHASE1_SMOKE_UNCERTAINTY_BAND = 0.05  # also full-run candidates within this score gap
 

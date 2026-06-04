@@ -103,9 +103,22 @@ ABLATION_VARIANTS = [
         "name": "training_schedule",
         "description": (
             "Diagnostic training-schedule probe: keep the model family and data split, but change "
-            "the optimisation schedule to reduce unstable false rejects. Use a lower learning "
-            "rate or scheduler, weight decay, early stopping on acceptance distance, and restore "
+            "the optimisation schedule to reduce unstable false rejects. Use a mandatory PyTorch "
+            "learning-rate schedule, weight decay, early stopping on acceptance distance, and restore "
             "the best validation checkpoint before testing."
+        ),
+    },
+    {
+        "name": "optimizer_lr_schedule",
+        "target_component": "optimizer/lr-schedule",
+        "description": (
+            "Diagnostic optimizer/lr-schedule probe: keep the model family, data split, "
+            "threshold policy, DRY_RUN/epochs contract, early stopping, and EPOCH_LOG output, "
+            "but deliberately tune the optimiser and scheduler. Generate a concrete variant "
+            "such as AdamW with tuned base LR, weight_decay, and CosineAnnealingWarmRestarts "
+            "T_0/T_mult; SGD momentum/nesterov with ReduceLROnPlateau stepped on validation "
+            "loss; or AdamW with ReduceLROnPlateau factor/patience/min_lr. A real PyTorch "
+            "learning-rate scheduler and correct scheduler.step() call remain mandatory."
         ),
     },
 ]
@@ -130,16 +143,19 @@ TARGETED_ABLATION_VARIANTS = {
         "no_augmentation",
         "temperature_scaling",
         "training_schedule",
+        "optimizer_lr_schedule",
     },
     "lot_shift_noise": {
         "lot_normalization",
         "no_augmentation",
         "temperature_scaling",
         "training_schedule",
+        "optimizer_lr_schedule",
     },
     "low_capacity_miss": {
         "no_stereo_fusion",
         "training_schedule",
+        "optimizer_lr_schedule",
         "no_weighted_loss",
     },
     "near_acceptance": {
@@ -535,14 +551,21 @@ Requirements for the diagnostic script:
 - Must use the train/val/test split paths from state["data_split"]
 - Must load Excel labels
 - Must preserve all other components except for the single change specified above
+- Must preserve or add a real PyTorch learning-rate schedule (`CosineAnnealingWarmRestarts`
+  or `ReduceLROnPlateau`) and call `scheduler.step()` correctly in the training loop.
 - If ablating stereo fusion (no_stereo_fusion): load only _L images; remove _R loading
 - If NOT ablating stereo fusion: continue loading both _L and _R images
 - If the variant name starts with `no_`, remove or disable only that component.
 - If the variant name is one of the diagnostic mechanism classes
   (`threshold_acceptance_distance`, `fp_penalty_loss`, `temperature_scaling`,
-  `lot_normalization`, `training_schedule`), apply the specified diagnostic improvement
+  `lot_normalization`, `training_schedule`, `optimizer_lr_schedule`), apply the specified diagnostic improvement
   and compare whether it closes the current acceptance gaps, especially overkill_rate
   and accuracy, without worsening miss_rate.
+  For `optimizer_lr_schedule`, change only the optimizer and LR scheduler block:
+  use a concrete, labeled combination such as AdamW+CosineAnnealingWarmRestarts,
+  SGD(momentum=0.9, nesterov=True)+ReduceLROnPlateau, or AdamW+ReduceLROnPlateau,
+  and preserve DRY_RUN, `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20`, early
+  stopping, and EPOCH_LOG output.
 
 ---
 ## STEP 3 — Save the diagnostic script
@@ -714,7 +737,8 @@ Steps:
 3. Compare each ablated variant against the baseline (state["current_best_score"]).
    For `no_*` variants, identify component removals that cause the biggest acceptance
    regression. For the diagnostic-probe variants (`threshold_acceptance_distance`,
-   `fp_penalty_loss`, `temperature_scaling`, `lot_normalization`, `training_schedule`),
+   `fp_penalty_loss`, `temperature_scaling`, `lot_normalization`, `training_schedule`,
+   `optimizer_lr_schedule`),
    identify changes that reduce the dominant acceptance gaps, especially overkill_rate
    and accuracy, while preserving miss_rate.
 4. Clearly state the recommended target component for the diagnosis agent. Prefer the

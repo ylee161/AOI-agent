@@ -115,6 +115,7 @@ def load_refinement_context_fn(tool_context) -> str:
         modality_block,
         f"OUTER_ITERATION: {s.get('outer_iteration', 0)}  INNER_ITERATION: {s.get('inner_iteration', 0)}",
         f"SELECTED_STRATEGY:\n{s.get('selected_refinement_strategy', '')}",
+        f"SELECTED_STRATEGY_FINGERPRINT:\n{json.dumps(s.get('selected_strategy_fingerprint', {}), default=str)}",
         f"STRATEGY_SELECTION_REASON:\n{s.get('strategy_selection_reason', '')}",
         f"STRATEGY_CANDIDATES:\n{json.dumps(s.get('refinement_strategy_candidates', {}), default=str)}",
         f"TARGET_COMPONENT: {diag.get('target_component', '')}",
@@ -245,6 +246,9 @@ The returned block contains:
     for this inner iteration. This is the primary instruction for what to implement.
     STRATEGY_SELECTION_REASON explains why; STRATEGY_CANDIDATES lists all candidates.
     **Implement exactly the selected strategy — do not substitute a different one.**
+- SELECTED_STRATEGY_FINGERPRINT — stable dedupe labels with target_component and
+    mechanism_class. When target_component is `optimizer/lr-schedule`, the
+    mechanism_class names the exact optimizer/scheduler combo to implement.
 - REFINEMENT_POPULATION (summary) — metrics of accepted improvements and lower-overkill
     non-best candidates. Preserve concrete FP-control mechanisms from lower-overkill
     candidates while keeping the current best pipeline as the primary starting point.
@@ -321,6 +325,33 @@ Translate the strategy name and description into specific code modifications. Co
   **NULL SAFETY — if `state["best_miss_rate"]` is absent or None, treat it as 1.0
   (worst case). Do NOT apply FP penalty when the key is missing.**
 
+If SELECTED_STRATEGY_FINGERPRINT.target_component is `optimizer/lr-schedule`,
+make optimizer and learning-rate schedule a first-class, isolated refinement:
+- Change only the optimizer/scheduler hyperparameters and their scheduler.step()
+  placement. Preserve the model architecture, data split, threshold policy, loss
+  family, DRY_RUN handling, `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20`, early
+  stopping, PROBE_METRICS, EPOCH_LOG, CALIBRATION_STATS, THRESHOLD_CURVE,
+  PREDICTIONS, and METRICS output.
+- Implement the selected mechanism_class concretely:
+  `adamw_cosine_restart_tune` -> AdamW with tuned lr/weight_decay and
+  `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=..., T_mult=..., eta_min=...)`.
+  `sgd_momentum_plateau` -> `torch.optim.SGD(..., lr=..., momentum=0.9,
+  nesterov=True, weight_decay=...)` with `ReduceLROnPlateau(optimizer, mode="min",
+  factor=..., patience=..., min_lr=...)` stepped as `scheduler.step(val_loss)`.
+  `adamw_plateau_decay` -> AdamW with tuned lr/weight_decay and
+  `ReduceLROnPlateau` stepped on validation loss.
+  `warm_restart_*` -> keep the existing optimizer family unless the selected
+  strategy explicitly says otherwise, raise the base LR back up for one SGDR-style
+  cycle with `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts`, and optionally
+  re-initialize only the final classification head if it is clearly isolated.
+- Add a simple script constant near the optimizer block, for example
+  `OPTIMIZER_LR_SCHEDULE_VARIANT = "sgd_momentum_plateau"`, so the attempted
+  combo is visible in logs and diffs. Do not emit this instead of METRICS; it is
+  just an in-script label.
+- A fixed-LR script is invalid for this target. The Fix #1 scheduler validator
+  will hard-reject variants without a real PyTorch scheduler and correct
+  scheduler.step() call.
+
 small-data-safe strategy policy for the current grouped train split (~287 samples):
 prefer, in priority order: (1) freeze or partially-freeze the pretrained backbone
 + small head, with partial-unfreeze adaptation preferred when full freeze underfits:
@@ -341,10 +372,12 @@ or L/R-desynchronizing affine/rotation/crop.
 ## STEP 3 — Save the refinement plan
 
 Call `save_refinement_plan_fn` with:
-- `target_component`    : the active component for this iteration. If
-                          error_analysis_report.recommended_target_component is
-                          present, use that value; otherwise use diagnosis_report
-                          target_component.
+- `target_component`    : the active component for this iteration. Prefer
+                          SELECTED_STRATEGY_FINGERPRINT.target_component when
+                          present. If absent, use error_analysis_report.
+                          recommended_target_component, otherwise diagnosis_report
+                          target_component. For optimizer and scheduler tuning,
+                          this must be exactly `optimizer/lr-schedule`.
 - `changes_summary`     : begin with the strategy name from state["selected_refinement_strategy"],
                           then one sentence describing the implementation (e.g.
                           "cross_attention_stereo: Replace channel-concat stereo fusion with cross-attention block")
@@ -412,6 +445,7 @@ The script must:
   random.seed(_seed); np.random.seed(_seed); torch.manual_seed(_seed); torch.cuda.manual_seed_all(_seed)
   ```
 - You MUST set `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20` with early stopping patience 3 epochs based on validation loss. Do NOT hardcode 5 — the line must read exactly `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20`.
+- Use a real PyTorch learning-rate schedule instead of a fixed LR. Prefer either `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)` (SGDR) or `torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)`. Instantiate the scheduler after the optimizer and call `scheduler.step()` correctly in the training loop: for `CosineAnnealingWarmRestarts`, step once per epoch (or batch with fractional epoch); for `ReduceLROnPlateau`, call `scheduler.step(val_loss)` after validation loss is computed. The validator will hard-reject schedule-less scripts.
 - Respect `config.TIMEOUT_SECONDS` (7200 s / 2 hours) — keep the script fast enough to finish
 - Must print `EPOCH_LOG: {{...}}` after each epoch (epoch, train_loss, val_loss, val_ng_recall, val_overkill)
 - Must print `PROBE_METRICS: {{...}}` before full training (ng_recall, overkill_rate,

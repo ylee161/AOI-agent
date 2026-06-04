@@ -17,10 +17,26 @@ from mle_star_agent.shared.analytical_state import analytical_state_line
 from mle_star_agent.shared.kb_semantic import rank_records_by_similarity
 from mle_star_agent.shared.checkpoint_io import checkpoint_exists, load_checkpoint, save_checkpoint
 from mle_star_agent.shared.small_data_strategy_validator import KNOWN_FAILED_STRATEGY_FINGERPRINTS
-from mle_star_agent.phases.phase2_refinement import fusion
+from mle_star_agent.phases.phase2_refinement import fusion, warm_restart
 from mle_star_agent.phases.phase2_refinement.ideator_agent import seek_help_tool
 
 logger = logging.getLogger(__name__)
+
+OPTIMIZER_LR_SCHEDULE_TARGET = "optimizer/lr-schedule"
+_TARGET_COMPONENT_ALIASES = {
+    "optimizer_lr_schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "optimizer lr schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "optimizer/lr schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "optimizer lr-schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "lr_schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "lr-schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+    "training_schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
+}
+
+
+def _normalise_target_component(target_component: str) -> str:
+    target = (target_component or "unknown").strip().lower()
+    return _TARGET_COMPONENT_ALIASES.get(target, target)
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +87,14 @@ def _paired_pending_checkpoint(path: Path) -> dict:
 
 def _infer_mechanism_class(target_component: str, strategy_text: str) -> str:
     text = f"{target_component} {strategy_text}".lower()
+    if "sgd" in text and "plateau" in text:
+        return "sgd_momentum_plateau"
+    if "adamw" in text and "plateau" in text:
+        return "adamw_plateau_decay"
+    if "adamw" in text and ("cosine" in text or "restart" in text):
+        return "adamw_cosine_restart_tune"
+    if "optimizer" in text or "lr-schedule" in text or "lr schedule" in text:
+        return "optimizer_lr_schedule_tune"
     if "fp_weight" in text or "false_positive" in text or "asymmetric" in text:
         return "fp_penalty_loss"
     if "focal" in text:
@@ -142,11 +166,11 @@ def _attempt_from_refinement_checkpoint(path: Path) -> dict | None:
     return {
         "outer": int(data.get("outer_iteration", outer_from_name) or 0),
         "inner": int(data.get("inner_iteration", inner_from_name) or inner_from_name),
-        "target_component": target_component,
+        "target_component": _normalise_target_component(target_component),
         "changes_summary": changes,
         "selected_strategy": selected_strategy,
         "strategy_fingerprint": {
-            "target_component": target_component.strip().lower(),
+            "target_component": _normalise_target_component(target_component),
             "mechanism_class": mechanism,
         },
         "result": {
@@ -476,7 +500,7 @@ def _tried_approaches_view(tried: list) -> str:
                 or (e.get("strategy_fingerprint") or {}).get("target_component")
                 or "unknown"
             )
-            tgt = str(tgt).strip().lower()
+            tgt = _normalise_target_component(str(tgt))
             target_counts[tgt] = target_counts.get(tgt, 0) + 1
 
     aggregate = {
@@ -571,7 +595,7 @@ _load_tried_tool = FunctionTool(func=load_tried_approaches_fn)
 
 def _normalise_strategy_fingerprint(target_component: str, mechanism_class: str) -> dict:
     return {
-        "target_component": (target_component or "unknown").strip().lower(),
+        "target_component": _normalise_target_component(target_component),
         "mechanism_class": (mechanism_class or "unknown").strip().lower(),
     }
 
@@ -641,14 +665,14 @@ def _failed_strategy_fingerprint_keys(tried_approaches: list) -> set:
 
 
 def _failed_attempt_count_for_target(tried_approaches: list, target_component: str) -> int:
-    target = (target_component or "unknown").strip().lower()
+    target = _normalise_target_component(target_component)
     count = 0
     for approach in tried_approaches or []:
         if not isinstance(approach, dict):
             continue
-        approach_target = (approach.get("target_component", "") or "").strip().lower()
+        approach_target = _normalise_target_component(approach.get("target_component", ""))
         fingerprint = approach.get("strategy_fingerprint") or {}
-        fingerprint_target = (fingerprint.get("target_component", "") or "").strip().lower()
+        fingerprint_target = _normalise_target_component(fingerprint.get("target_component", ""))
         if target not in {approach_target, fingerprint_target}:
             continue
         # Only count true P0/P1 failures toward rotation lock — overkill regressions
@@ -885,12 +909,69 @@ def _consume_pending_fusion(tool_context) -> str | None:
     return f"FUSION_STRATEGY_INSTALLED: {fingerprint}. {directive}"
 
 
+def _consume_pending_warm_restart(tool_context) -> str | None:
+    """If stagnation armed a warm restart, override the strategy once.
+
+    The evaluator sets ``pending_warm_restart`` before falling through to ideation.
+    This gate consumes the flag and installs an optimizer/lr-schedule directive
+    tied to the current best script hash. The normal tried_approaches dedup gate
+    still prevents repeating a failed warm restart fingerprint.
+    """
+    state = tool_context.state
+    if not state.get("pending_warm_restart"):
+        return None
+    state.pop("pending_warm_restart", None)
+
+    best_sha = (state.get("warm_restart_best_sha") or "").strip()
+    if not best_sha:
+        best_sha = warm_restart.best_script_sha(state)
+        state["warm_restart_best_sha"] = best_sha
+
+    raw_fingerprint = warm_restart.warm_restart_fingerprint(best_sha)
+    fingerprint = _normalise_strategy_fingerprint(
+        raw_fingerprint.get("target_component", ""),
+        raw_fingerprint.get("mechanism_class", ""),
+    )
+    if _fingerprint_key(fingerprint) in _failed_strategy_fingerprint_keys(
+        state.get("tried_approaches", [])
+    ):
+        logger.info("Warm restart skipped: fingerprint %s already failed.", fingerprint)
+        return None
+
+    n = int(state.get("outer_iteration", 0))
+    m = int(state.get("inner_iteration", 0))
+    directive = warm_restart.build_warm_restart_directive(best_sha)
+    state["refinement_strategy_candidates"] = {"warm_restart": directive}
+    state["refinement_strategy_fingerprints"] = {"warm_restart": fingerprint}
+    state["selected_refinement_strategy"] = directive
+    state["selected_strategy_fingerprint"] = fingerprint
+    state["selected_refinement_strategy_key"] = "warm_restart"
+    state["selected_refinement_strategy_outer"] = n
+    state["selected_refinement_strategy_inner"] = m
+    state["strategy_selection_reason"] = (
+        "Inner-loop stagnation below relaxed acceptance; try one SGDR-style "
+        "optimizer/lr-schedule warm restart of the current best script before "
+        "fresh ideation."
+    )
+    logger.info(
+        "Strategy gate installed WARM_RESTART directive (outer=%d, inner=%d, fingerprint=%s).",
+        n, m, fingerprint,
+    )
+    return f"WARM_RESTART_STRATEGY_INSTALLED: {fingerprint}. {directive}"
+
+
 def ensure_selected_strategy_fn(tool_context) -> str:
     """
     Ensure state["selected_refinement_strategy"] exists before the coder runs.
     The planner should set this, but the coder must not proceed with an empty
     strategy if the LLM forgot to call save_strategy_candidates_fn.
     """
+    # Plateau warm restart is the cheapest stagnation reflex; try it before
+    # broader cross-branch fusion or normal strategy fallback.
+    warm_restart_status = _consume_pending_warm_restart(tool_context)
+    if warm_restart_status is not None:
+        return warm_restart_status
+
     # Cross-branch fusion takes precedence when armed at the last stagnation.
     fusion_status = _consume_pending_fusion(tool_context)
     if fusion_status is not None:
@@ -1109,6 +1190,11 @@ Determine the active target component first:
   the active target. It is based on cheap probe evidence and overrides low-confidence
   diagnosis prose.
 - Otherwise use `diagnosis_report.target_component`.
+Valid target components include architecture/model capacity, augmentation,
+weighted_loss, stereo_fusion, calibration, threshold_sweep, preprocessing/
+lot_normalization, and `optimizer/lr-schedule`. The optimizer target is first
+class: choose it when plateau evidence, unstable validation loss, or prior
+fixed optimizer/scheduler settings are the likely bottleneck.
 
 For the active target component, propose exactly 3 strategies that are
 mechanistically distinct from each other, from the recent `changes_summary` entries
@@ -1191,6 +1277,14 @@ For target "threshold_sweep":
   B. Two-stage constrained sweep: first find zero-FN region, then minimize FP
   C. Per-lot threshold: sweep separately on each lot's val samples
 
+For target "optimizer/lr-schedule":
+  A. adamw_cosine_restart_tune: keep AdamW but tune base LR, weight_decay,
+     CosineAnnealingWarmRestarts T_0/T_mult, and eta_min for a smoother plateau exit.
+  B. sgd_momentum_plateau: switch AdamW to SGD(momentum=0.9, nesterov=True)
+     with ReduceLROnPlateau stepped on validation loss.
+  C. adamw_plateau_decay: keep AdamW but swap cosine restarts for
+     ReduceLROnPlateau and tune factor, patience, min_lr, and weight_decay.
+
 For low-confidence diagnosis before probes:
   A. preflight_probe: run representation separability, loss sensitivity, and
      threshold-frontier probes only; print PROBE_METRICS with recommended target.
@@ -1231,7 +1325,13 @@ Call `save_strategy_candidates_fn` with all arguments:
 Use stable lowercase enum-like mechanism classes, for example:
 `temperature_scaling`, `isotonic_calibration`, `class_balanced_sampler`,
 `focal_loss`, `fp_penalty_loss`, `stereo_diff_features`, `lot_normalization`,
-`threshold_acceptance_distance`, `training_schedule`.
+`threshold_acceptance_distance`, `adamw_cosine_restart_tune`,
+`sgd_momentum_plateau`, `adamw_plateau_decay`.
+
+Use the canonical target component `optimizer/lr-schedule` when the active
+component is optimizer choice, base learning rate, weight decay, scheduler
+class, scheduler period, or plateau patience/factor. Treat legacy
+`training_schedule` references as this same target for rotation and dedupe.
 
 If the tool returns `DUPLICATE_STRATEGY_REJECTED`, select a different candidate
 with a new fingerprint and call the tool again before moving on.

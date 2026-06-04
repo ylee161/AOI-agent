@@ -22,18 +22,38 @@ class RunResult:
 # ─── Debug-mode (accelerated) patching ───────────────────────────────────────
 # When run_script(debug_mode=True) is requested we rewrite the script *text*
 # before execution so a broken or slow script fails fast instead of timing out:
-#   1. any assignment to an "*epoch*" variable has its RHS forced to 1, and
+#   1. the full-run epoch count is forced to config.CURVE_ABORT_DEBUG_EPOCHS
+#      (a SHORT curve, not a single noisy epoch, so the smoke run can emit an
+#      extrapolatable per-epoch learning curve) — covering both the mandated
+#      `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20` ternary and bare integer
+#      assignments to training-length epoch variables, and
 #   2. the first argument of every DataLoader(...) call is wrapped in a helper
 #      that subsets the dataset to 5% of its samples.
 # The rewrite is applied to a local copy only — the caller's `script` string
 # (the one that actually gets scored) is never mutated.
 
-# Match assignments whose LHS variable name contains "epoch" (case-insensitive)
-# and replace only the integer literal on the RHS with 1. The variable name is
-# preserved so any downstream reference (e.g. `range(num_epochs)`) keeps working.
-# Requires `= <int>` (single `=`), so it never matches `==` comparisons.
+# Cap the full-run epoch count to the debug cap so the smoke run stays short.
+# Two forms are handled, because real scripts (per the coder-agent prompts) emit
+# the *ternary* form, not a bare literal:
+#   1. _EPOCH_TERNARY_RE rewrites the post-`else` full-run literal in the mandated
+#        epochs = DRY_RUN_EPOCHS if DRY_RUN else 20
+#      ternary. The debug run does NOT set DRY_RUN, so the script takes the `else`
+#      branch — without this rewrite it would run the full 20 epochs and the
+#      "short curve" the curve-abort relies on would never materialise.
+#   2. _EPOCH_ASSIGN_RE rewrites a bare integer literal assigned to a
+#      TRAINING-length epoch variable (epochs / num_epochs / max_epochs / ...).
+#
+# The LHS name is preserved so downstream references (e.g. `range(num_epochs)`)
+# keep working. We deliberately do NOT match scheduler/counter variables such as
+# warmup_epochs, patience_epochs, best_epoch or epochs_done: forcing those to the
+# cap would corrupt training/scheduler semantics and could manufacture a
+# misleading learning curve. The literal pattern also swallows any float/exponent
+# tail (e.g. `1e3`) so it is replaced whole rather than leaving a stray `e3`.
+# Both require `= <number>` (single `=`), so neither ever matches `==`.
+_EPOCH_TERNARY_RE = re.compile(r"(\bif\s+DRY_RUN\s+else\s+)\d+\b")
 _EPOCH_ASSIGN_RE = re.compile(
-    r"\b(\w*epochs?\w*\s*=\s*)\d+",
+    r"\b((?:num_|n_|max_|total_|train_|num_train_)?epochs?\s*=\s*)"
+    r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?",
     re.IGNORECASE,
 )
 
@@ -60,11 +80,14 @@ _DEBUG_CAP_HELPER = (
 
 
 def apply_debug_patches(script: str) -> str:
-    """Return a debug-accelerated copy of `script` (caps epochs to 1 and data to 5%).
+    """Return a debug-accelerated copy of `script` (caps epochs to
+    config.CURVE_ABORT_DEBUG_EPOCHS and data to 5%).
 
     Pure function over the script text — does not touch the input string.
     """
-    patched = _EPOCH_ASSIGN_RE.sub(lambda m: m.group(1) + "1", script)
+    epoch_cap = str(int(config.CURVE_ABORT_DEBUG_EPOCHS))
+    patched = _EPOCH_TERNARY_RE.sub(lambda m: m.group(1) + epoch_cap, script)
+    patched = _EPOCH_ASSIGN_RE.sub(lambda m: m.group(1) + epoch_cap, patched)
     patched = _DATALOADER_RE.sub(
         lambda m: m.group(1) + (m.group(2) or "") + "__aoi_cap5(" + m.group(3) + ")",
         patched,

@@ -176,6 +176,7 @@ class FusionTriggerTests(unittest.TestCase):
                     "token_count": 0,
                     "refinement_population": members,
                     "selected_refinement_strategy": "focal_loss: x",
+                    "warm_restart_attempted_best_9d503588": True,
                 })
                 out = evaluator_agent.evaluate_and_update_fn(ctx)
 

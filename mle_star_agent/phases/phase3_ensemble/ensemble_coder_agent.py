@@ -244,6 +244,7 @@ Regardless of strategy:
   weighted averaging or max-probability threshold specialization. The verifier must
   only review samples predicted NG and must explicitly try to rescue obvious G false positives.
 - You MUST set `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20` for each base model, with early stopping patience 3 epochs based on validation loss. Do NOT hardcode 5 — the line must read exactly `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20`. Keep total execution time under `config.TIMEOUT_SECONDS` (7200 s / 2 hours).
+- Each trained component MUST use a real PyTorch learning-rate schedule instead of a fixed LR. Prefer either `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)` (SGDR) or `torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)`, and call `scheduler.step()` correctly in the training loop.
 - Base each component model on the BEST_PIPELINE_SCRIPT returned by
   `load_ensemble_context_fn` — modify only the aspects required by the chosen strategy.
 
