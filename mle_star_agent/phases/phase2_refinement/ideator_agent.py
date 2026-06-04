@@ -168,6 +168,16 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
+def _split_failure_mode_payload(failure_mode: str) -> tuple[str, str]:
+    """Return the canonical failure_mode plus any seek-help query emphasis."""
+    raw = (failure_mode or "").strip()
+    marker = "| planner roadblock:"
+    if marker not in raw:
+        return raw.lower(), ""
+    mode, emphasis = raw.split(marker, 1)
+    return mode.strip().lower(), _clean(emphasis)
+
+
 def _build_query(failure_mode: str, overkill_rate: float, miss_rate: float) -> str:
     """Build the arXiv search_query from the failure mode + metric emphasis.
 
@@ -175,8 +185,9 @@ def _build_query(failure_mode: str, overkill_rate: float, miss_rate: float) -> s
     overkill rate biases toward false-positive/precision work, a high miss rate
     biases toward recall/sensitivity work.
     """
-    mode = (failure_mode or "").strip().lower()
+    mode, query_emphasis = _split_failure_mode_payload(failure_mode)
     mode_terms = _FAILURE_MODE_TERMS.get(mode, "")
+    query_emphasis = re.sub(r"[^A-Za-z0-9_\- ]+", " ", query_emphasis)
 
     metric_terms = ""
     if overkill_rate >= miss_rate and overkill_rate > 0.0:
@@ -184,7 +195,7 @@ def _build_query(failure_mode: str, overkill_rate: float, miss_rate: float) -> s
     elif miss_rate > 0.0:
         metric_terms = "recall sensitivity miss rate reduction"
 
-    raw = " ".join(t for t in (_BASE_TERMS, mode_terms, metric_terms) if t)
+    raw = " ".join(t for t in (_BASE_TERMS, mode_terms, metric_terms, query_emphasis) if t)
     # arXiv `all:` field with '+'-joined terms (an OR-ish keyword bag).
     return "all:" + "+".join(raw.split())
 
@@ -245,8 +256,8 @@ def generate_technique_hints(
     failure-mode list if the fetch yields too few results. Always returns between
     :data:`_MIN_HINTS` and :data:`_MAX_HINTS` non-empty, de-duplicated strings.
     """
-    mode = (failure_mode or "").strip().lower()
-    query = _build_query(mode, overkill_rate, miss_rate)
+    mode, _query_emphasis = _split_failure_mode_payload(failure_mode)
+    query = _build_query(failure_mode, overkill_rate, miss_rate)
     logger.info(
         "ideator: failure_mode=%r overkill=%.3f miss=%.3f ng_recall=%.3f query=%r",
         mode or "(unknown)", overkill_rate, miss_rate, ng_recall, query,
@@ -312,9 +323,74 @@ def ideate_technique_hints_fn(tool_context) -> str:
     )
 
 
+def _read_failure_mode_and_metrics(state) -> tuple[str, float, float, float]:
+    """Read failure_mode plus metric snapshot from state, tolerating empty state."""
+    if not hasattr(state, "get"):
+        return "", 0.0, 1.0, 1.0
+
+    failure_mode = ""
+    for source_key in ("diagnosis_brief", "diagnosis_report"):
+        blob = state.get(source_key) or {}
+        if isinstance(blob, dict):
+            classification = blob.get("failure_classification") or {}
+            if isinstance(classification, dict):
+                failure_mode = (classification.get("failure_mode") or "").strip()
+                if failure_mode:
+                    break
+
+    ng_recall = float(state.get("current_best_score", 0.0) or 0.0)
+    overkill_rate = float(state.get("best_overkill_rate", 1.0) or 1.0)
+    saved_miss = state.get("best_miss_rate")
+    miss_rate = float(saved_miss) if saved_miss is not None else max(0.0, 1.0 - ng_recall)
+    return failure_mode, overkill_rate, miss_rate, ng_recall
+
+
+def seek_help_fn(tool_context, problem: str) -> str:
+    """Return fresh on-demand technique ideas without clobbering planner hints.
+
+    This is a read-oriented planner helper. It keys ideation to the current
+    failure_mode and metric snapshot, folds the planner's specific roadblock into
+    the arXiv query emphasis, stores the most recent response under
+    ``state["seek_help_hints"]``, and deliberately leaves
+    ``state["retrieved_technique_hints"]`` untouched.
+    """
+    try:
+        state = getattr(tool_context, "state", None)
+        failure_mode, overkill_rate, miss_rate, ng_recall = _read_failure_mode_and_metrics(state)
+        problem_text = _clean(str(problem or ""))
+        failure_mode_with_emphasis = failure_mode
+        if problem_text:
+            failure_mode_with_emphasis = (
+                f"{failure_mode or 'unknown'} | planner roadblock: {problem_text}"
+            )
+
+        hints = generate_technique_hints(
+            failure_mode_with_emphasis,
+            overkill_rate,
+            miss_rate,
+            ng_recall,
+        )
+
+        if hasattr(state, "__setitem__"):
+            state["seek_help_hints"] = hints
+
+        return (
+            f"SEEK_HELP_HINTS: {len(hints)} fresh on-demand hint(s) for "
+            f"failure_mode={failure_mode or '(unknown)'} (overkill={overkill_rate:.3f}, "
+            f"miss_rate={miss_rate:.3f}, ng_recall={ng_recall:.3f}). "
+            "These are advisory only; any derived strategy must still pass the "
+            "failed-fingerprint gate.\n- "
+            + "\n- ".join(hints)
+        )
+    except Exception as exc:  # pragma: no cover - defensive; tool must not break planning
+        logger.warning("ideator: seek_help failed: %s", exc)
+        return f"SEEK_HELP_UNAVAILABLE: {type(exc).__name__}: {exc}"
+
+
 # FunctionTool wrapper (satisfies the "FunctionTool-backed helper" contract and
 # allows the same logic to be wired into an ADK agent if ever needed).
 ideator_tool = FunctionTool(func=ideate_technique_hints_fn)
+seek_help_tool = FunctionTool(func=seek_help_fn)
 
 
 def trigger_ideation(tool_context) -> str:
@@ -334,6 +410,8 @@ def trigger_ideation(tool_context) -> str:
 
 __all__ = [
     "ideator_tool",
+    "seek_help_tool",
+    "seek_help_fn",
     "ideate_technique_hints_fn",
     "generate_technique_hints",
     "trigger_ideation",

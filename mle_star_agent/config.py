@@ -91,6 +91,16 @@ PROBE_OVERKILL_REJECT_MAX = 0.50  # reject cheap probes that already false-rejec
 PROBE_NG_RECALL_REJECT_MIN = 0.80  # reject probes with severe NG recall collapse
 PROBE_PROBABILITY_GAP_MIN = 0.05  # require NG mean probability to exceed G mean by this much
 
+# KompeteAI-style predictive early-abort on the debug smoke-run (max_epochs=1, 5% data).
+# These gates run on the METRICS the *micro-run* already prints, so an obviously-bad
+# refinement variant is pruned BEFORE paying for the 45-60 min full training run.
+# They are deliberately MUCH looser than the probe-gate / acceptance thresholds above
+# because a 1-epoch / 5%-data run is NOISY: we only abort on EGREGIOUS failure and let
+# every borderline / near-target candidate fall through to the full run. When in doubt,
+# run the full job (absence of parseable METRICS on 5% data is NOT evidence of a bad script).
+DEBUG_PREDICT_OVERKILL_MAX = 0.60   # abort only if the micro-run already false-rejects most G
+DEBUG_PREDICT_NG_RECALL_MIN = 0.50  # abort only on severe NG-recall collapse
+
 # Execution
 TIMEOUT_SECONDS = 7200  # 2 hours — ResNet18 15-epoch CPU training takes ~45-60 min per script
 DEBUG_CHECK_TIMEOUT_SECONDS = 120  # cap for debug_mode smoke runs (max_epochs=1, 5% data)

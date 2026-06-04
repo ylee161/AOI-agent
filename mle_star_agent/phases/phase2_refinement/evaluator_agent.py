@@ -16,6 +16,7 @@ from mle_star_agent.shared.acceptance_scoring import (
     passes_relaxed_acceptance,
 )
 from mle_star_agent.shared import code_runner, loop_guard, metric_guard
+from mle_star_agent.shared.code_diff import make_code_diff
 from mle_star_agent.shared.callbacks import (
     count_tokens_callback,
     log_context_size_callback,
@@ -40,6 +41,7 @@ from mle_star_agent.shared.diagnosis_scorer import (
     detect_early_collapse,
 )
 from mle_star_agent.phases.phase2_refinement.ideator_agent import trigger_ideation
+from mle_star_agent.phases.phase2_refinement import fusion
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +439,63 @@ def evaluate_and_update_fn(tool_context) -> str:
             f"no_improve_count now {no_improve}."
         )
 
+    # ---- predictive early-abort (KompeteAI): prune EGREGIOUS variants from the
+    # cheap micro-run before paying for the full run. The smoke run already prints
+    # METRICS on 1 epoch / 5% data; we parse them and only abort when they are
+    # *unambiguously* bad. This is intentionally conservative: a 1-epoch/5%-data run
+    # is noisy, so the gates (config.DEBUG_PREDICT_*) are far looser than acceptance,
+    # and missing/degenerate metrics never prune — borderline candidates get the full run.
+    debug_parsed = parse_metrics(debug_result.stdout)
+    # mode="subsample" waives only the runtime floor (the debug run is intentionally
+    # fast on 5% data); the ng/g-count and separability checks still drop dummy splits.
+    debug_metrics = metric_guard.guard_metrics(
+        debug_parsed,
+        debug_result.duration_ms,
+        mode="subsample",
+        context=f"phase2 debug predict outer={n} inner={m}",
+    )
+    if debug_metrics is not None and (
+        float(debug_metrics.overkill_rate) > config.DEBUG_PREDICT_OVERKILL_MAX
+        or float(debug_metrics.ng_recall) < config.DEBUG_PREDICT_NG_RECALL_MIN
+    ):
+        logger.warning(
+            "Debug predict pruned (outer=%d, inner=%d): micro-run overkill=%.3f "
+            "ng_recall=%.3f — skipping full run",
+            n, m, debug_metrics.overkill_rate, debug_metrics.ng_recall,
+        )
+        m_next = m + 1
+        tool_context.state["inner_iteration"] = m_next
+        no_improve += 1
+        tool_context.state["no_improve_count"] = no_improve
+
+        config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        attempt_data = {
+            "outer_iteration": n,
+            "inner_iteration": m_next,
+            "returncode":      debug_result.returncode,
+            "timed_out":       debug_result.timed_out,
+            "duration_ms":     round(debug_result.duration_ms, 1),
+            "improved":        False,
+            "failure_reason":  "debug_predicted_low_utility",
+            "new_score":       0.0,
+            "new_overkill":    1.0,
+            "current_best_score":   float(tool_context.state.get("current_best_score", 0.0)),
+            "current_best_overkill": float(tool_context.state.get("best_overkill_rate", 1.0)),
+            "no_improve_count":   no_improve,
+            "metrics":         None,
+            "stdout_tail":     debug_result.stdout[-3000:],
+            "stderr_tail":     debug_result.stderr[-1000:],
+        }
+        save_checkpoint(config.ckpt_refinement(n, m), attempt_data)
+        return (
+            f"DEBUG PREDICT PRUNED (outer={n}, inner={m}): accelerated smoke run "
+            f"already shows overkill={debug_metrics.overkill_rate:.3f} "
+            f"(max {config.DEBUG_PREDICT_OVERKILL_MAX}) / "
+            f"ng_recall={debug_metrics.ng_recall:.3f} "
+            f"(min {config.DEBUG_PREDICT_NG_RECALL_MIN}); full run skipped. "
+            f"inner_iteration now {m_next}, no_improve_count now {no_improve}."
+        )
+
     # ---- execute the script ----
     logger.info("Evaluator running script (outer=%d, inner=%d)", n, m)
     result = code_runner.run_script(
@@ -543,6 +602,10 @@ def evaluate_and_update_fn(tool_context) -> str:
     if prediction_failed and metrics is not None and not passes_relaxed_acceptance(metrics):
         improved = False
 
+    # Capture the previous best script BEFORE the improvement block can overwrite
+    # it below; the persistent KB diff is prev_best -> current.
+    prev_best_script = tool_context.state.get("best_pipeline_script", "") or ""
+
     if improved:
         tool_context.state["current_best_score"]   = new_score
         tool_context.state["best_overkill_rate"]   = new_overkill
@@ -647,21 +710,55 @@ def evaluate_and_update_fn(tool_context) -> str:
     config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     save_checkpoint(config.CKPT_TRIED_APPROACHES, {"tried_approaches": tried})
 
-    # Persistent AOI knowledge base (MLEvolve): append-only cross-run memory.
-    # Each record has exactly four fields: plan, code_snippet, metrics, label.
+    # Persistent AOI knowledge base (MLEvolve "Experience-Driven Global Memory"):
+    # append-only cross-run memory. Each record is a quadruple:
+    #   {plan, code_diff, metrics, tags}
+    # - code_diff is a TRUNCATED unified diff (prev best -> current); never the
+    #   full script.
+    # - tags is a categorical list: [failure_mode (if any), "improved"|"regressed"].
     # Load the existing list first and write the whole list back — never overwrite.
-    kb_records = []
-    if checkpoint_exists(config.CKPT_PERSISTENT_KB):
-        existing_kb = load_checkpoint(config.CKPT_PERSISTENT_KB)
-        if isinstance(existing_kb, list):
-            kb_records = list(existing_kb)
-    kb_records.append({
-        "plan": selected_strategy,
-        "code_snippet": script[:300],
-        "metrics": result_dict,
-        "label": "success" if improved else "failure",
-    })
-    save_checkpoint(config.CKPT_PERSISTENT_KB, kb_records)
+    # Wrapped so a KB write failure never raises into the evaluator hot path.
+    try:
+        kb_records = []
+        if checkpoint_exists(config.CKPT_PERSISTENT_KB):
+            existing_kb = load_checkpoint(config.CKPT_PERSISTENT_KB)
+            if isinstance(existing_kb, list):
+                kb_records = list(existing_kb)
+
+        # failure_mode lives under failure_classification in diagnosis_brief
+        # (primary) or diagnosis_report (mirror). Empty-safe.
+        failure_mode = ""
+        for source_key in ("diagnosis_brief", "diagnosis_report"):
+            blob = tool_context.state.get(source_key) or {}
+            if isinstance(blob, dict):
+                classification = blob.get("failure_classification") or {}
+                if isinstance(classification, dict):
+                    failure_mode = (classification.get("failure_mode") or "").strip()
+                    if failure_mode:
+                        break
+
+        kb_tags = []
+        if failure_mode:
+            kb_tags.append(failure_mode)
+        kb_tags.append("improved" if improved else "regressed")
+
+        kb_metrics = {
+            "ng_recall":     result_dict["ng_recall"],
+            "miss_rate":     result_dict["miss_rate"],
+            "overkill_rate": result_dict["overkill"],
+            "accuracy":      result_dict["accuracy"],
+            "improved":      result_dict["improved"],
+        }
+
+        kb_records.append({
+            "plan": selected_strategy,
+            "code_diff": make_code_diff(prev_best_script, script),
+            "metrics": kb_metrics,
+            "tags": kb_tags,
+        })
+        save_checkpoint(config.CKPT_PERSISTENT_KB, kb_records)
+    except Exception:
+        logger.exception("Persistent AOI KB write failed; continuing.")
 
     # Build a human-readable metrics line for the return value
     if probe_rejected:
@@ -719,6 +816,12 @@ def evaluate_and_update_fn(tool_context) -> str:
     # ---- Priority 1b: below-relaxed inner stagnation restart ----
     if loop_guard.should_restart_inner_for_stagnation(tool_context.state):
         n_next = n + 1
+        # Cross-branch fusion arming (MCGS Evolution/Fusion): when the archive holds
+        # >=2 diverse members, arm a fusion attempt for the upcoming outer cycle so
+        # the strategy gate fuses their winning blocks instead of refining a single
+        # chain. Must run BEFORE the counters below are reset — should_trigger_fusion
+        # re-checks the stagnation signal, which depends on no_improve_count.
+        fusion_status = fusion.arm_fusion_if_eligible(tool_context.state, target_outer=n_next)
         tool_context.state["outer_iteration"] = n_next
         tool_context.state["inner_iteration"] = 0
         tool_context.state["no_improve_count"] = 0
@@ -741,7 +844,7 @@ def evaluate_and_update_fn(tool_context) -> str:
             f"{config.INNER_STAGNATION_MAX_UNCONSTRAINED} below-relaxed attempts. "
             f"outer_iteration advanced to {n_next}, inner_iteration reset to 0, "
             "and ablation state cleared. Escalating inner loop; outer loop continues.\n"
-            f"{ideation_status}"
+            f"{ideation_status}\n{fusion_status}"
         )
 
     # ---- Priority 2: mid-inner early-stop ----

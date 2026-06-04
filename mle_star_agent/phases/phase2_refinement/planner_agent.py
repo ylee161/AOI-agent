@@ -13,8 +13,11 @@ from mle_star_agent.shared.callbacks import (
     log_context_size_callback,
     rate_limit_retry_callback,
 )
+from mle_star_agent.shared.analytical_state import analytical_state_line
 from mle_star_agent.shared.checkpoint_io import checkpoint_exists, load_checkpoint, save_checkpoint
 from mle_star_agent.shared.small_data_strategy_validator import KNOWN_FAILED_STRATEGY_FINGERPRINTS
+from mle_star_agent.phases.phase2_refinement import fusion
+from mle_star_agent.phases.phase2_refinement.ideator_agent import seek_help_tool
 
 logger = logging.getLogger(__name__)
 
@@ -187,13 +190,105 @@ def _merge_tried_histories(*histories: list[dict]) -> list[dict]:
     ))
     return merged
 
-def _persistent_kb_summary() -> str:
-    """Compact cross-run KB block for the planner prompt.
+def _kb_record_tags(record: dict) -> list:
+    """Tags for a KB record, with back-compat for legacy records.
 
-    Reads the append-only persistent_aoi_kb.json written by the evaluator. Surfaces
-    the top 5 success records by ng_recall and every failure record (plan + metrics)
-    so the planner can avoid repeating cross-run dead ends. Returns "" silently if
-    the file does not exist or is unusable — never raises.
+    New records carry a categorical ``tags`` list ([failure_mode?, outcome]).
+    Legacy records only have a coarse ``label`` ("success"|"failure"); derive an
+    outcome tag from it so old entries still roll up. Never raises.
+    """
+    raw = record.get("tags")
+    if isinstance(raw, list) and raw:
+        return [str(t) for t in raw if t]
+    label = record.get("label")
+    if label == "success":
+        return ["improved"]
+    if label == "failure":
+        return ["regressed"]
+    return []
+
+
+def retrieve_kb_records(records: list, failure_mode: str, k: int = 6) -> list:
+    """Return recent KB records matching ``failure_mode``, with recent backfill.
+
+    The persistent KB is append-ordered. Select the most recent matching records,
+    backfill with the most recent non-matching records if needed, then restore
+    append order for the returned top-K slice. Never raises on malformed input.
+    """
+    try:
+        limit = int(k)
+    except (TypeError, ValueError):
+        limit = 6
+    if limit <= 0:
+        return []
+
+    wanted = str(failure_mode or "").strip()
+    indexed = [
+        (idx, record)
+        for idx, record in enumerate(records or [])
+        if isinstance(record, dict)
+    ]
+    if not wanted:
+        return [record for _, record in indexed[-limit:]]
+
+    matches = []
+    others = []
+    for idx, record in indexed:
+        try:
+            tags = _kb_record_tags(record)
+        except Exception:
+            tags = []
+        if wanted in tags:
+            matches.append((idx, record))
+        else:
+            others.append((idx, record))
+
+    selected = matches[-limit:]
+    if len(selected) < limit:
+        selected.extend(others[-(limit - len(selected)):])
+    selected.sort(key=lambda item: item[0])
+    return [record for _, record in selected[-limit:]]
+
+
+def _current_failure_mode(state: dict) -> str:
+    """Read current failure_mode from diagnosis_brief, falling back to report."""
+    if not isinstance(state, dict):
+        return ""
+    for source_key in ("diagnosis_brief", "diagnosis_report"):
+        blob = state.get(source_key) or {}
+        if not isinstance(blob, dict):
+            continue
+        classification = blob.get("failure_classification") or {}
+        if not isinstance(classification, dict):
+            continue
+        failure_mode = str(classification.get("failure_mode") or "").strip()
+        if failure_mode:
+            return failure_mode
+    return ""
+
+
+def _kb_record_prompt_view(record: dict) -> dict:
+    diff = record.get("code_diff") or ""  # legacy records lack code_diff -> ""
+    diff_excerpt = diff[:160].replace("\n", "\\n")
+    metrics = record.get("metrics") or {}
+    return {
+        "plan": record.get("plan", ""),
+        "tags": _kb_record_tags(record),
+        "ng_recall": metrics.get("ng_recall"),
+        "diff_excerpt": diff_excerpt,
+    }
+
+
+def _persistent_kb_summary(failure_mode: str | None = None, k: int = 6) -> str:
+    """Compact cross-run KB block for the planner prompt (MLEvolve quadruple schema).
+
+    Reads the append-only persistent_aoi_kb.json written by the evaluator. Rolls
+    records up by (failure_mode, outcome) tag so the planner can see which
+    dead-ends keep recurring (e.g. "failure_mode=g_ng_overlap x3 regressed"), then
+    shows the most recent few plans with a SHORT diff excerpt — never the full
+    list or any full script. Back-compatible with legacy {plan, code_snippet,
+    metrics, label} records (missing code_diff -> "", legacy tag from label).
+    Returns "" silently if the file does not exist or is unusable — never raises.
     """
     if not checkpoint_exists(config.CKPT_PERSISTENT_KB):
         return ""
@@ -204,30 +299,51 @@ def _persistent_kb_summary() -> str:
     if not isinstance(records, list) or not records:
         return ""
 
-    successes = [r for r in records if isinstance(r, dict) and r.get("label") == "success"]
-    failures = [r for r in records if isinstance(r, dict) and r.get("label") == "failure"]
+    dicts = [r for r in records if isinstance(r, dict)]
+    if not dicts:
+        return ""
 
-    def _ng_recall(record: dict) -> float:
-        metrics = record.get("metrics") or {}
-        try:
-            return float(metrics.get("ng_recall", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
+    # Roll up by (failure_mode, outcome) so recurring dead-ends are visible.
+    # Plain dict preserves insertion order (Python 3.7+).
+    combo_counter: dict = {}
+    for r in dicts:
+        tags = _kb_record_tags(r)
+        outcome = (
+            "improved" if "improved" in tags
+            else "regressed" if "regressed" in tags
+            else "?"
+        )
+        fmodes = [t for t in tags if t not in ("improved", "regressed")]
+        fmode = fmodes[0] if fmodes else "none"
+        combo_counter[(fmode, outcome)] = combo_counter.get((fmode, outcome), 0) + 1
+    rollup_items = sorted(combo_counter.items(), key=lambda kv: kv[1], reverse=True)[:8]
+    tag_rollup = ", ".join(
+        f"failure_mode={fm} x{count} {oc}" for (fm, oc), count in rollup_items
+    )
 
-    top_successes = sorted(successes, key=_ng_recall, reverse=True)[:5]
-    top_view = [
-        {"plan": r.get("plan", ""), "metrics": r.get("metrics", {})}
-        for r in top_successes
-    ]
-    failure_view = [
-        {"plan": r.get("plan", ""), "metrics": r.get("metrics", {})}
-        for r in failures
-    ]
+    # Failure-mode keyed top-K view for the current planner turn. The rollup
+    # remains global so recurring dead-ends across all modes stay visible.
+    current_failure_mode = str(failure_mode or "").strip()
+    if current_failure_mode:
+        selected_records = retrieve_kb_records(dicts, current_failure_mode, k=k)
+        matched_view = [_kb_record_prompt_view(r) for r in selected_records]
+        return (
+            f"PERSISTENT_KB (top-K matching failure_mode={current_failure_mode}) "
+            f"({len(records)} total record(s)):\n"
+            f"TAG_ROLLUP (global; avoid repeating recurring dead-ends): {tag_rollup}\n"
+            f"MATCHED_RECORDS (max {len(matched_view)}, plan + tags + ng_recall + "
+            f"short diff): {json.dumps(matched_view, default=str)}"
+        )
+
+    # Most recent records (append order): plan + tags + ng_recall + short diff excerpt.
+    recent_view = [_kb_record_prompt_view(r) for r in dicts[-5:]]
+
     return (
         "PERSISTENT_KB_SUMMARY (cross-run AOI knowledge base — "
         f"{len(records)} total record(s)):\n"
-        f"TOP_SUCCESSES (by ng_recall, max 5): {json.dumps(top_view, default=str)}\n"
-        f"FAILURES (avoid repeating): {json.dumps(failure_view, default=str)}"
+        f"TAG_ROLLUP (avoid repeating recurring dead-ends): {tag_rollup}\n"
+        f"RECENT (most recent {len(recent_view)}, plan + short diff): "
+        f"{json.dumps(recent_view, default=str)}"
     )
 
 
@@ -303,9 +419,10 @@ def load_tried_approaches_fn(tool_context) -> str:
     else:
         modality_block = "INPUT_MODALITY: stereo"
 
-    kb_summary = _persistent_kb_summary()
+    kb_summary = _persistent_kb_summary(failure_mode=_current_failure_mode(tool_context.state))
     kb_block = f"\n\n{kb_summary}" if kb_summary else ""
     return (
+        f"{analytical_state_line(tool_context.state)}\n\n"
         f"{modality_block}\n\n"
         f"{status}\n\n"
         f"{_tried_approaches_view(tried)}\n\n"
@@ -417,6 +534,17 @@ def _context_reports_block(state: dict) -> str:
                 "TECHNIQUE_HINTS (advisory, retrieved small-data techniques — NOT "
                 "pre-approved; any derived strategy still passes the failed-fingerprint "
                 f"gate): {json.dumps(hint_strs, default=str)}"
+            )
+
+    seek_help_hints = state.get("seek_help_hints", []) or []
+    if isinstance(seek_help_hints, list) and seek_help_hints:
+        hint_strs = [str(h).strip() for h in seek_help_hints if str(h).strip()]
+        if hint_strs:
+            parts.append(
+                "SEEK_HELP_HINTS (freshly pulled on-demand ideas from the planner's "
+                "last seek_help call — advisory only; any derived strategy still "
+                "passes the failed-fingerprint gate): "
+                f"{json.dumps(hint_strs, default=str)}"
             )
 
     return "\n".join(parts)
@@ -688,12 +816,73 @@ _save_candidates_tool = FunctionTool(func=save_strategy_candidates_fn)
 # FunctionTool — guarantee a selected strategy before coding
 # ---------------------------------------------------------------------------
 
+def _consume_pending_fusion(tool_context) -> str | None:
+    """If a fusion attempt was armed at the last stagnation, override the selected
+    strategy with a cross-branch fusion directive (MCGS Evolution/Fusion).
+
+    Runs at the top of the strategy gate, before the planner's strategy is confirmed.
+    Returns a status string when a fusion directive is installed, or None to fall
+    through to the normal strategy logic. ``pending_fusion`` is always consumed; the
+    KNOWN_FAILED gate and the per-pair tried_approaches dedup still apply, so an
+    ineligible/already-failed pair cleanly degrades to normal refinement.
+    """
+    state = tool_context.state
+    if not state.get("pending_fusion"):
+        return None
+    # Consume the flag regardless of outcome so it cannot leak into later cycles.
+    state.pop("pending_fusion", None)
+
+    members = fusion.top_fusion_members(state, k=2)
+    if len(members) < 2:
+        return None  # archive shrank — nothing to fuse, fall through.
+
+    raw_fingerprint = fusion.fusion_fingerprint(members[0], members[1])
+    fingerprint = _normalise_strategy_fingerprint(
+        raw_fingerprint.get("target_component", ""),
+        raw_fingerprint.get("mechanism_class", ""),
+    )
+    input_modality = state.get("input_modality", "stereo")
+    if _is_known_failed_strategy_fingerprint(fingerprint, input_modality):
+        logger.info("Fusion skipped: pair fingerprint %s is KNOWN_FAILED.", fingerprint)
+        return None
+    if _fingerprint_key(fingerprint) in _failed_strategy_fingerprint_keys(
+        state.get("tried_approaches", [])
+    ):
+        logger.info("Fusion skipped: pair fingerprint %s already failed.", fingerprint)
+        return None
+
+    n = int(state.get("outer_iteration", 0))
+    m = int(state.get("inner_iteration", 0))
+    directive = fusion.build_fusion_directive(state, members)
+    state["refinement_strategy_candidates"] = {"fusion": directive}
+    state["refinement_strategy_fingerprints"] = {"fusion": fingerprint}
+    state["selected_refinement_strategy"] = directive
+    state["selected_strategy_fingerprint"] = fingerprint
+    state["selected_refinement_strategy_key"] = "fusion"
+    state["selected_refinement_strategy_outer"] = n
+    state["selected_refinement_strategy_inner"] = m
+    state["strategy_selection_reason"] = (
+        "Cross-branch fusion of the top-2 refinement_population members after inner "
+        "stagnation; transplant the donor's winning block onto the base."
+    )
+    logger.info(
+        "Strategy gate installed FUSION directive (outer=%d, inner=%d, fingerprint=%s).",
+        n, m, fingerprint,
+    )
+    return f"FUSION_STRATEGY_INSTALLED: {fingerprint}. {directive}"
+
+
 def ensure_selected_strategy_fn(tool_context) -> str:
     """
     Ensure state["selected_refinement_strategy"] exists before the coder runs.
     The planner should set this, but the coder must not proceed with an empty
     strategy if the LLM forgot to call save_strategy_candidates_fn.
     """
+    # Cross-branch fusion takes precedence when armed at the last stagnation.
+    fusion_status = _consume_pending_fusion(tool_context)
+    if fusion_status is not None:
+        return fusion_status
+
     n = int(tool_context.state.get("outer_iteration", 0))
     m = int(tool_context.state.get("inner_iteration", 0))
     selected = (tool_context.state.get("selected_refinement_strategy") or "").strip()
@@ -818,6 +1007,11 @@ From the `load_tried_approaches_fn` output (STEP 1), use:
   lower-overkill non-best candidates (metrics only). Use it to avoid single-chain
   tunnel vision: if one archived candidate has much lower overkill but slightly
   worse recall, propose a strategy that preserves its FP control while recovering recall.
+- TECHNIQUE_HINTS — advisory small-data technique ideas retrieved earlier.
+- SEEK_HELP_HINTS — freshly pulled on-demand ideas from the most recent
+  `seek_help_fn` call (the seek_help tool), if present. Treat them as advisory
+  only; any derived strategy still goes through the same KNOWN_FAILED /
+  strategy_gate dedup path.
 - TRIED_APPROACHES_RECENT — the last few prior attempts in full (from the load
     tool output). Each entry has: outer, inner, target_component, changes_summary,
     strategy_fingerprint, result.ng_recall, result.overkill,
@@ -907,6 +1101,14 @@ For the active target component, propose exactly 3 strategies that are
 mechanistically distinct from each other, from the recent `changes_summary` entries
 in TRIED_APPROACHES_RECENT, and from every `(target_component, mechanism_class)` pair
 in TRIED_APPROACHES_AGGREGATE.failed_fingerprints.
+
+If the existing context and TECHNIQUE_HINTS do not give you a concrete, novel
+strategy for the current failure mode — for example, your best candidate would
+otherwise repeat a KNOWN_FAILED or already-failed fingerprint — you may call
+`seek_help_fn` once with a short description of the specific roadblock. Read the
+returned hints and incorporate only ideas that still pass the failed-fingerprint
+and duplicate-strategy checks. Call `seek_help_fn` at most once in this planner
+turn to bound token use.
 
 small-data-safe strategy priority for this project:
 1. freeze or partially-freeze the pretrained backbone + small head, with
@@ -1045,7 +1247,7 @@ refinement_planner_agent = LlmAgent(
         "one to attempt next. Writes state['selected_refinement_strategy']."
     ),
     instruction=_INSTRUCTION,
-    tools=[_load_tried_tool, _save_candidates_tool],
+    tools=[_load_tried_tool, seek_help_tool, _save_candidates_tool],
     include_contents="none",
     before_model_callback=[log_context_size_callback, budget_stop_callback],
     after_model_callback=count_tokens_callback,

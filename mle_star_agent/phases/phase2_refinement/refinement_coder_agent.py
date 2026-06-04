@@ -6,11 +6,13 @@ from google.adk.tools import FunctionTool
 
 from mle_star_agent import config
 from mle_star_agent.guards.code_validator_agent import code_validator_tool, store_validation_cache_tool
+from mle_star_agent.shared.analytical_state import analytical_state_line
 from mle_star_agent.shared.callbacks import (
     count_tokens_callback,
     rate_limit_retry_callback,
 )
 from mle_star_agent.shared.checkpoint_io import checkpoint_exists, load_checkpoint
+from mle_star_agent.phases.phase2_refinement import fusion
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,7 @@ def load_refinement_context_fn(tool_context) -> str:
         modality_block = "INPUT_MODALITY: stereo"
 
     parts = [
+        analytical_state_line(s),
         modality_block,
         f"OUTER_ITERATION: {s.get('outer_iteration', 0)}  INNER_ITERATION: {s.get('inner_iteration', 0)}",
         f"SELECTED_STRATEGY:\n{s.get('selected_refinement_strategy', '')}",
@@ -142,6 +145,28 @@ def load_refinement_context_fn(tool_context) -> str:
 
 
 _load_context_tool = FunctionTool(func=load_refinement_context_fn)
+
+
+def load_fusion_scripts_fn(tool_context) -> str:
+    """
+    Fetch the FULL text + metrics of the top-2 refinement_population members for a
+    cross-branch FUSION attempt (load-on-demand, like get_best_pipeline_script).
+
+    Call this ONLY when SELECTED_STRATEGY starts with the fusion marker
+    (`cross_branch_fusion`). Returns FUSION_SCRIPT_0 (BASE) and FUSION_SCRIPT_1
+    (DONOR) with their metrics, prefixed by the mono/stereo modality contract.
+    Returns an error string (never raises) if fewer than 2 members are archived.
+    """
+    members = fusion.top_fusion_members(tool_context.state, k=2)
+    if len(members) < 2:
+        return (
+            "FUSION_SCRIPTS_UNAVAILABLE: refinement_population has fewer than 2 "
+            "members — implement the selected strategy as a normal single-script change."
+        )
+    return fusion.render_fusion_scripts(tool_context.state, members)
+
+
+_load_fusion_scripts_tool = FunctionTool(func=load_fusion_scripts_fn)
 
 # ---------------------------------------------------------------------------
 # Refinement plan FunctionTool
@@ -251,6 +276,18 @@ probe-only script. It should run cheap diagnostics, print exactly one
 `ng_recall`, `overkill_rate`, `G_prob_mean`, `NG_prob_mean`, `probability_gap`,
 and `recommended_target_component`, then exit before full training. This is not
 a failed model; it is evidence collection for the next planner pass.
+
+If `state["selected_refinement_strategy"]` starts with `cross_branch_fusion`, this
+is a FUSION attempt, not a normal single-script change. Call `load_fusion_scripts_fn`
+to fetch the two full population scripts (FUSION_SCRIPT_0 = BASE, FUSION_SCRIPT_1 =
+DONOR) with their metrics. Keep the BASE as the skeleton (one model, one training
+loop) and transplant ONLY the single block where the DONOR is measurably better
+(its loss / augmentation / calibration / threshold logic) — do NOT stitch two
+incompatible backbones. If the two are architecturally incompatible to fuse cleanly,
+transplant only the donor's architecture-agnostic data/loss/calibration/threshold
+block onto the base. Honor the INPUT_MODALITY line in both the directive and the
+fetched scripts EXACTLY — never introduce stereo code for mono input. The fused
+script must print the standard METRICS line and all the usual diagnostic lines.
 
 Otherwise, implement `state["selected_refinement_strategy"]` exactly as described.
 Translate the strategy name and description into specific code modifications. Consider:
@@ -424,7 +461,7 @@ refinement_coder_agent = LlmAgent(
         "and outputs the complete refined script as state['current_script']."
     ),
     instruction=_INSTRUCTION,
-    tools=[_load_context_tool, _save_plan_tool, code_validator_tool, store_validation_cache_tool],
+    tools=[_load_context_tool, _load_fusion_scripts_tool, _save_plan_tool, code_validator_tool, store_validation_cache_tool],
     output_key="current_script",
     include_contents="none",
     after_model_callback=count_tokens_callback,

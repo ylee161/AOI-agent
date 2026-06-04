@@ -11,6 +11,7 @@ from mle_star_agent.shared.callbacks import (
     log_context_size_callback,
     rate_limit_retry_callback,
 )
+from mle_star_agent.shared.analytical_state import compute_analytical_state
 from mle_star_agent.shared.checkpoint_io import checkpoint_exists, load_checkpoint, save_checkpoint
 from mle_star_agent.shared.checkpoint_lineage import lineage_matches, stable_json_sha256
 
@@ -248,6 +249,16 @@ def write_error_analysis_report_fn(
         "metrics_consistency": evidence.get("metrics_consistency"),
         "source_error_analysis_path": tool_context.state.get("latest_error_analysis_path", ""),
     }
+
+    # Deterministic analytical-state label: which two-tier acceptance target the
+    # loop is currently chasing. Derived from current-best metrics already in
+    # state (no LLM invents it). Empty-safe — must never raise into this hook.
+    try:
+        analytical = compute_analytical_state(tool_context.state)
+        tool_context.state["analytical_state"] = analytical
+        report["analytical_state"] = analytical.get("label")
+    except Exception:
+        logger.warning("analytical_state computation skipped (non-fatal).", exc_info=True)
 
     tool_context.state["error_analysis_report"] = report
 

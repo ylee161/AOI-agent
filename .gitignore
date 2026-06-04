@@ -9,6 +9,7 @@ build/
 .eggs/
 
 # Virtual environment
+.venv
 .venv/
 venv/
 env/
@@ -29,6 +30,7 @@ ablations/
 
 # Datasets (user supplies their own)
 [SUP046]*/
+aoi_agent_dataset/
 data/
 data_split/
 data_split.json

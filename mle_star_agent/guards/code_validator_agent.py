@@ -13,6 +13,9 @@ from mle_star_agent.shared.difference_feature_validator import (
 from mle_star_agent.shared.small_data_strategy_validator import (
     validate_small_data_strategy_source,
 )
+from mle_star_agent.shared.data_usage_validator import (
+    validate_data_usage_source,
+)
 
 # ---------------------------------------------------------------------------
 # Dry-run environment injected during validation.
@@ -154,6 +157,19 @@ def static_small_data_strategy_check_fn(tool_context, script: str) -> dict:
     return validate_small_data_strategy_source(script, input_modality=input_modality)
 
 
+def static_data_usage_check_fn(tool_context, script: str) -> dict:
+    """AST/static check (CHECK 3) that the script USES the declared data.
+
+    Complements the CHECK 1 leakage audit: confirms both stereo images, the
+    Excel labels, and the provided split are actually read. Deterministic and
+    never executes the script; degrades to a best-effort text scan on parse
+    failure. The modality drives the stereo exemption — mono and the
+    no_stereo_fusion ablation are never flagged for an unused right image.
+    """
+    input_modality = tool_context.state.get("input_modality", "stereo")
+    return validate_data_usage_source(script, input_modality=input_modality)
+
+
 def append_failed_script_fn(tool_context, script_name: str, error: str, attempts: int) -> str:
     """Record a script that exhausted all debug retry attempts into state['failed_scripts']."""
     failed = list(tool_context.state.get("failed_scripts", []) or [])
@@ -168,6 +184,7 @@ static_fp_penalty_check_tool = FunctionTool(func=static_fp_penalty_check_fn)
 static_degenerate_threshold_guard_check_tool = FunctionTool(func=static_degenerate_threshold_guard_check_fn)
 static_difference_feature_check_tool = FunctionTool(func=static_difference_feature_check_fn)
 static_small_data_strategy_check_tool = FunctionTool(func=static_small_data_strategy_check_fn)
+static_data_usage_check_tool = FunctionTool(func=static_data_usage_check_fn)
 _append_failed_script_tool = FunctionTool(func=append_failed_script_fn)
 
 # ---------------------------------------------------------------------------
@@ -344,6 +361,32 @@ regularized head; localized patch/ROI or local L/R difference evidence. Calibrat
 threshold curves are REPORTING, not the only fix.
 
 ---
+## CHECK 2H — Data Usage Audit (Static Analysis, no execution)
+
+This is the "Data Usage Checker" guardrail — the complement of CHECK 1 (leakage).
+CHECK 1 asks whether the script touches data it must NOT; CHECK 2H asks whether it
+actually USES the data it MUST. Call `static_data_usage_check_fn` with the script.
+It is AST/static and never executes the script.
+
+The report lists any violations in `messages`:
+  - "stereo input but right image unused" — the modality is stereo and the script
+    loads `_L` but never references the `_R` right image;
+  - "labels not loaded" — no evidence the Excel labels are read (no
+    `pandas.read_excel` / `.xlsx` / `openpyxl`);
+  - "ignores provided split" — no reference to the injected split
+    (`data_split` / the train/val/test paths).
+
+This audit is NON-FATAL by default: surface the findings so they can be fixed, the
+same way CHECK 1/CHECK 2 results are surfaced. If `messages` is non-empty, prefer to
+rewrite the script to load the missing data before proceeding; if `inconclusive` is
+True (the script could not be parsed for this audit) treat it as informational only.
+
+EXEMPTIONS (already applied inside the check — do NOT override them):
+  - `input_modality == "mono"` never raises "right image unused" (mono has no _R);
+  - a script declaring `ABLATION_VARIANT_NAME = "no_stereo_fusion"` legitimately
+    uses only `_L`, so it is never flagged for an unused right image.
+
+---
 ## CHECK 2D — Per-Sample Prediction Output (Static Analysis, no execution)
 
 Read the (possibly rewritten) script and verify that it prints at least one of the following
@@ -447,6 +490,7 @@ code_validator_agent = LlmAgent(
         static_degenerate_threshold_guard_check_tool,
         static_difference_feature_check_tool,
         static_small_data_strategy_check_tool,
+        static_data_usage_check_tool,
         run_script_tool,
         _append_failed_script_tool,
     ],
