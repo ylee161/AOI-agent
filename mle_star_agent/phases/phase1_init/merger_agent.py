@@ -10,6 +10,11 @@ from mle_star_agent.shared.checkpoint_io import (
     load_checkpoint,
     save_checkpoint,
 )
+from mle_star_agent.shared.selection_metrics import (
+    AVERAGED_EVALUATION_KEY,
+    select_best_record,
+    selection_metrics_for_record,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,20 @@ def _metric_value(
     if value is None:
         value = default
     return float(value)
+
+
+def _select_best_successful_candidate(scores: list[dict]) -> dict | None:
+    successful = [
+        s for s in scores
+        if s.get("status") == "success" and s.get("metrics") is not None
+    ]
+    best = select_best_record(successful)
+    if best is None:
+        return None
+
+    best = dict(best)
+    best["selection_metrics"] = selection_metrics_for_record(best)
+    return best
 
 
 def _l0_candidate_name() -> str | None:
@@ -100,6 +119,7 @@ def check_and_load_phase2_init_fn(tool_context) -> str:
     tool_context.state["best_f1"]               = _metric_value(
         resume, recovered_metrics, "best_f1", "f1", 0.0
     )
+    tool_context.state["best_selection_evaluation"] = resume.get("best_selection_evaluation")
     tool_context.state["best_pipeline_script"]  = resume.get("best_pipeline_script", l0["L0_script"])
     tool_context.state["refinement_population"] = resume.get("refinement_population", [])
     tool_context.state["no_improve_count"]      = resume.get("no_improve_count", 0)
@@ -132,7 +152,8 @@ def initialize_phase2_fn(tool_context) -> str:
     Deterministically select the best candidate from state['candidate_scores'],
     write all Phase 2 initialisation state keys, and save L0.json + phase2_init.json.
 
-    Selection priority: lowest miss_rate → highest ng_recall → highest f1 → lowest overkill_rate.
+    Selection uses averaged selection metrics when present, falling back to the
+    original single-run metrics only when the averaged evaluation is incomplete.
     Falls back to the first available script if no candidate succeeded.
     """
     scores = tool_context.state.get("candidate_scores", [])
@@ -141,25 +162,13 @@ def initialize_phase2_fn(tool_context) -> str:
     # Build a name→script lookup
     script_map = {s.get("name"): s.get("script", "") for s in scripts}
 
-    # Rank successful candidates deterministically
-    successful = [
-        s for s in scores
-        if s.get("status") == "success" and s.get("metrics") is not None
-    ]
-    if successful:
-        best = sorted(
-            successful,
-            key=lambda s: (
-                s["metrics"].get("miss_rate", 1.0),
-                -s["metrics"].get("ng_recall", 0.0),
-                -s["metrics"].get("f1", 0.0),
-                s["metrics"].get("overkill_rate", 1.0),
-            ),
-        )[0]
+    best = _select_best_successful_candidate(scores)
+    if best is not None:
         best_candidate_name = best["name"]
-        l0_score   = float(best["metrics"].get("ng_recall",    0.0))
-        l0_overkill = float(best["metrics"].get("overkill_rate", 1.0))
-        l0_miss_rate = float(best["metrics"].get("miss_rate", _miss_rate_from_score(l0_score)))
+        selection_metrics = best["selection_metrics"]
+        l0_score   = float(selection_metrics.get("ng_recall",    0.0))
+        l0_overkill = float(selection_metrics.get("overkill_rate", 1.0))
+        l0_miss_rate = float(selection_metrics.get("miss_rate", _miss_rate_from_score(l0_score)))
         l0_script  = script_map.get(best_candidate_name, "")
         logger.info(
             "Selected L0='%s' (ng_recall=%.4f, overkill=%.4f)",
@@ -176,6 +185,8 @@ def initialize_phase2_fn(tool_context) -> str:
         l0_overkill = 1.0
         l0_miss_rate = 1.0
         l0_script   = fallback["script"]
+        selection_metrics = {}
+        best = {}
 
     if not l0_script:
         return f"ERROR: script for candidate '{best_candidate_name}' is empty."
@@ -189,8 +200,9 @@ def initialize_phase2_fn(tool_context) -> str:
     tool_context.state["current_best_score"]     = l0_score
     tool_context.state["best_overkill_rate"]     = l0_overkill
     tool_context.state["best_miss_rate"]         = l0_miss_rate
-    tool_context.state["best_accuracy"]          = float(best["metrics"].get("accuracy", 0.0)) if successful else 0.0
-    tool_context.state["best_f1"]                = float(best["metrics"].get("f1", 0.0)) if successful else 0.0
+    tool_context.state["best_accuracy"]          = float(selection_metrics.get("accuracy", 0.0))
+    tool_context.state["best_f1"]                = float(selection_metrics.get("f1", 0.0))
+    tool_context.state["best_selection_evaluation"] = best.get(AVERAGED_EVALUATION_KEY)
     tool_context.state["best_pipeline_script"]   = l0_script
     tool_context.state["no_improve_count"]       = 0
     tool_context.state["outer_iteration"]        = 0
@@ -213,6 +225,8 @@ def initialize_phase2_fn(tool_context) -> str:
         "L0_miss_rate": l0_miss_rate,
         "L0_accuracy": tool_context.state["best_accuracy"],
         "L0_f1": tool_context.state["best_f1"],
+        AVERAGED_EVALUATION_KEY: best.get(AVERAGED_EVALUATION_KEY),
+        "selection_metrics": selection_metrics,
         "best_candidate_name": best_candidate_name,
     })
 
@@ -222,6 +236,7 @@ def initialize_phase2_fn(tool_context) -> str:
         "best_miss_rate":         l0_miss_rate,
         "best_accuracy":          tool_context.state["best_accuracy"],
         "best_f1":                tool_context.state["best_f1"],
+        "best_selection_evaluation": tool_context.state["best_selection_evaluation"],
         "best_pipeline_script":   l0_script,
         "no_improve_count":       0,
         "outer_iteration":        0,
@@ -264,7 +279,7 @@ Call `check_and_load_phase2_init_fn`.
 
 Call `initialize_phase2_fn` with no arguments. It will:
 - Read `state["candidate_scores"]` and `state["candidate_scripts"]` directly
-- Select the best candidate deterministically (lowest miss_rate → highest ng_recall → highest f1)
+- Select the best candidate deterministically using averaged selection metrics when available
 - Write all Phase 2 state keys and save L0.json + phase2_init.json
 
 ---
@@ -272,6 +287,7 @@ Call `initialize_phase2_fn` with no arguments. It will:
 
 After `initialize_phase2_fn` returns, produce a brief summary:
 - The selected L0 candidate name and its key metrics (miss_rate, ng_recall, overkill_rate, f1, threshold)
+- Whether averaged selection metrics were used
 - Confirmation that L0.json and phase2_init.json were saved
 - The preserved token_count carried over from Phase 1
 """

@@ -162,7 +162,12 @@ def test_egregious_overkill_micro_run_is_pruned():
     assert "DEBUG PREDICT PRUNED" in message
     assert saved is not None
     assert saved["failure_reason"] == "debug_predicted_low_utility"
+    assert saved["smoke_metrics"]["overkill_rate"] == 0.9
+    assert saved["smoke_score"] is not None
+    assert saved["full_run_executed"] is False
+    assert saved["full_run_reason"] == "smoke_pruned_egregious"
     assert "METRICS" in saved["stdout_tail"]  # debug metrics carried into stdout_tail
+    assert context.state["latest_smoke_run"]["metrics"]["overkill_rate"] == 0.9
     assert context.state["inner_iteration"] == 1
     assert context.state["no_improve_count"] == 1
 
@@ -177,6 +182,10 @@ def test_near_target_micro_run_is_not_pruned():
     assert "DEBUG PREDICT PRUNED" not in message
     if saved is not None:
         assert saved.get("failure_reason") != "debug_predicted_low_utility"
+        assert saved["smoke_metrics"]["ng_recall"] == 0.98
+        assert saved["smoke_score"] is not None
+        assert saved["full_run_executed"] is True
+        assert saved["full_run_reason"] == "full_run_after_smoke"
 
 
 def test_missing_micro_run_metrics_is_not_pruned():
@@ -189,6 +198,10 @@ def test_missing_micro_run_metrics_is_not_pruned():
     assert "DEBUG PREDICT PRUNED" not in message
     if saved is not None:
         assert saved.get("failure_reason") != "debug_predicted_low_utility"
+        assert saved["smoke_metrics"] is None
+        assert saved["smoke_score"] is None
+        assert saved["full_run_executed"] is True
+        assert saved["full_run_reason"] == "full_run_after_smoke"
 
 
 if __name__ == "__main__":

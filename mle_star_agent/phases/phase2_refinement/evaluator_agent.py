@@ -27,6 +27,12 @@ from mle_star_agent.shared.checkpoint_io import (
     load_checkpoint,
     save_checkpoint,
 )
+from mle_star_agent.shared.selection_metrics import (
+    AVERAGED_EVALUATION_KEY,
+    average_metrics_dicts,
+    build_selection_evaluation,
+)
+from mle_star_agent.shared.aoi_smoke_triage import build_smoke_diagnostics
 from mle_star_agent.shared.metrics_parser import (
     AOIMetrics,
     metrics_to_dict,
@@ -67,6 +73,7 @@ def _save_best_pipeline(state: dict) -> None:
         "best_f1":            state.get("best_f1", 0.0),
         "best_roc_auc":       state.get("best_roc_auc", 0.0),
         "best_prob_gap":      state.get("best_prob_gap", 0.0),
+        "best_selection_evaluation": state.get("best_selection_evaluation"),
         "best_pipeline_script": state.get("best_pipeline_script", ""),
         # Preserve Phase 3 progress if it already ran; fall back to Phase 2 best.
         "ensemble_best_score":   state.get("ensemble_best_score", current_best_score),
@@ -186,21 +193,6 @@ def _probe_rejection_reason(probe_metrics: dict | None) -> str | None:
     return None
 
 
-def _average_metrics_dicts(metric_dicts: list[dict]) -> dict:
-    keys = (
-        "accuracy", "ng_recall", "miss_rate", "overkill_rate", "f1",
-        "avg_latency_ms", "threshold", "ng_count", "g_count", "tp", "tn", "fp", "fn",
-        "roc_auc", "prob_gap",
-    )
-    averaged = {}
-    for key in keys:
-        values = [float(m.get(key, 0.0) or 0.0) for m in metric_dicts]
-        averaged[key] = sum(values) / len(values) if values else 0.0
-    for key in ("ng_count", "g_count", "tp", "tn", "fp", "fn"):
-        averaged[key] = int(round(averaged[key]))
-    return averaged
-
-
 def _metrics_from_dict(metrics: dict) -> AOIMetrics:
     def value(key: str, default):
         raw = metrics.get(key, default)
@@ -307,7 +299,34 @@ def _run_multiseed_confirmation(script: str) -> tuple[AOIMetrics | None, list[di
     successful = [r["metrics"] for r in seed_results if r.get("metrics") is not None]
     if len(successful) != len(config.MULTISEED_CONFIRMATION_SEEDS):
         return None, seed_results
-    return _metrics_from_dict(_average_metrics_dicts(successful)), seed_results
+    return _metrics_from_dict(average_metrics_dicts(successful)), seed_results
+
+
+def _confirm_improvement_with_selection_average(
+    *,
+    script: str,
+    metrics,
+    current_metrics: dict,
+    initially_improved: bool,
+    run_average=None,
+) -> tuple[bool, dict, dict | None]:
+    metrics_dict = _normalise_metrics_dict(metrics)
+    if not _requires_multiseed_confirmation(metrics_dict, initially_improved):
+        return initially_improved, metrics_dict, None
+
+    run_average = run_average or _run_multiseed_confirmation
+    averaged_metrics, seed_results = run_average(script)
+    selection_evaluation = build_selection_evaluation(
+        seeds=config.MULTISEED_CONFIRMATION_SEEDS,
+        seed_results=seed_results,
+        averaged_metrics=_normalise_metrics_dict(averaged_metrics) if averaged_metrics is not None else None,
+    )
+    if selection_evaluation.get("status") != "success":
+        return False, metrics_dict, selection_evaluation
+
+    selected_metrics = dict(selection_evaluation["metrics"])
+    improved = is_acceptance_improvement(selected_metrics, current_metrics)
+    return improved, selected_metrics, selection_evaluation
 
 
 def _update_refinement_population(
@@ -403,6 +422,23 @@ def evaluate_and_update_fn(tool_context) -> str:
         env={"AOI_RANDOM_SEED": "42", "PYTHONHASHSEED": "42", "SEED": "42"},
         debug_mode=True,
     )
+    smoke = build_smoke_diagnostics(
+        debug_result.stdout,
+        debug_result.duration_ms,
+        context=f"phase2 debug predict outer={n} inner={m}",
+    )
+    smoke_record = {
+        "metrics": smoke.get("metrics"),
+        "score": smoke.get("score"),
+        "diagnostics": {
+            "probe_metrics": smoke.get("probe_metrics"),
+            "calibration_stats": smoke.get("calibration_stats"),
+            "threshold_curve": smoke.get("threshold_curve"),
+            "epoch_logs": smoke.get("epoch_logs"),
+            "early_collapse": smoke.get("early_collapse"),
+        },
+    }
+    tool_context.state["latest_smoke_run"] = smoke_record
     if debug_result.returncode != 0:
         logger.warning(
             "Debug pre-check failed (outer=%d, inner=%d, rc=%d) — skipping full run",
@@ -428,6 +464,11 @@ def evaluate_and_update_fn(tool_context) -> str:
             "current_best_overkill": float(tool_context.state.get("best_overkill_rate", 1.0)),
             "no_improve_count":   no_improve,
             "metrics":         None,
+            "smoke_metrics":    smoke_record["metrics"],
+            "smoke_score":      smoke_record["score"],
+            "smoke_diagnostics": smoke_record["diagnostics"],
+            "full_run_executed": False,
+            "full_run_reason":  "smoke_check_failed",
             "stdout_tail":     debug_result.stdout[-3000:],
             "stderr_tail":     debug_result.stderr[-1000:],
         }
@@ -445,23 +486,15 @@ def evaluate_and_update_fn(tool_context) -> str:
     # *unambiguously* bad. This is intentionally conservative: a 1-epoch/5%-data run
     # is noisy, so the gates (config.DEBUG_PREDICT_*) are far looser than acceptance,
     # and missing/degenerate metrics never prune — borderline candidates get the full run.
-    debug_parsed = parse_metrics(debug_result.stdout)
-    # mode="subsample" waives only the runtime floor (the debug run is intentionally
-    # fast on 5% data); the ng/g-count and separability checks still drop dummy splits.
-    debug_metrics = metric_guard.guard_metrics(
-        debug_parsed,
-        debug_result.duration_ms,
-        mode="subsample",
-        context=f"phase2 debug predict outer={n} inner={m}",
-    )
+    debug_metrics = smoke_record["metrics"]
     if debug_metrics is not None and (
-        float(debug_metrics.overkill_rate) > config.DEBUG_PREDICT_OVERKILL_MAX
-        or float(debug_metrics.ng_recall) < config.DEBUG_PREDICT_NG_RECALL_MIN
+        float(debug_metrics.get("overkill_rate", 0.0)) > config.DEBUG_PREDICT_OVERKILL_MAX
+        or float(debug_metrics.get("ng_recall", 1.0)) < config.DEBUG_PREDICT_NG_RECALL_MIN
     ):
         logger.warning(
             "Debug predict pruned (outer=%d, inner=%d): micro-run overkill=%.3f "
             "ng_recall=%.3f — skipping full run",
-            n, m, debug_metrics.overkill_rate, debug_metrics.ng_recall,
+            n, m, debug_metrics["overkill_rate"], debug_metrics["ng_recall"],
         )
         m_next = m + 1
         tool_context.state["inner_iteration"] = m_next
@@ -483,15 +516,20 @@ def evaluate_and_update_fn(tool_context) -> str:
             "current_best_overkill": float(tool_context.state.get("best_overkill_rate", 1.0)),
             "no_improve_count":   no_improve,
             "metrics":         None,
+            "smoke_metrics":    smoke_record["metrics"],
+            "smoke_score":      smoke_record["score"],
+            "smoke_diagnostics": smoke_record["diagnostics"],
+            "full_run_executed": False,
+            "full_run_reason":  "smoke_pruned_egregious",
             "stdout_tail":     debug_result.stdout[-3000:],
             "stderr_tail":     debug_result.stderr[-1000:],
         }
         save_checkpoint(config.ckpt_refinement(n, m), attempt_data)
         return (
             f"DEBUG PREDICT PRUNED (outer={n}, inner={m}): accelerated smoke run "
-            f"already shows overkill={debug_metrics.overkill_rate:.3f} "
+            f"already shows overkill={debug_metrics['overkill_rate']:.3f} "
             f"(max {config.DEBUG_PREDICT_OVERKILL_MAX}) / "
-            f"ng_recall={debug_metrics.ng_recall:.3f} "
+            f"ng_recall={debug_metrics['ng_recall']:.3f} "
             f"(min {config.DEBUG_PREDICT_NG_RECALL_MIN}); full run skipped. "
             f"inner_iteration now {m_next}, no_improve_count now {no_improve}."
         )
@@ -558,24 +596,22 @@ def evaluate_and_update_fn(tool_context) -> str:
         new_metrics=metrics,
         current_metrics=current_metrics,
     )
-    multiseed_results = []
-    if run_ok and _requires_multiseed_confirmation(metrics, improved):
-        averaged_metrics, multiseed_results = _run_multiseed_confirmation(script)
-        tool_context.state["latest_multiseed_confirmation"] = multiseed_results
-        if averaged_metrics is None:
-            improved = False
+    selection_evaluation = None
+    if run_ok:
+        improved, selected_metrics, selection_evaluation = _confirm_improvement_with_selection_average(
+            script=script,
+            metrics=metrics,
+            current_metrics=current_metrics,
+            initially_improved=improved,
+        )
+        if selection_evaluation is not None:
+            tool_context.state["latest_multiseed_confirmation"] = selection_evaluation
+            if selection_evaluation.get("status") == "success":
+                metrics = _metrics_from_dict(selected_metrics)
+                new_score = float(metrics.ng_recall)
+                new_overkill = float(metrics.overkill_rate)
         else:
-            metrics = averaged_metrics
-            new_score = float(metrics.ng_recall)
-            new_overkill = float(metrics.overkill_rate)
-            improved = _is_improvement(
-                new_score,
-                new_overkill,
-                current_best,
-                current_best_overkill,
-                new_metrics=metrics,
-                current_metrics=current_metrics,
-            )
+            tool_context.state.pop("latest_multiseed_confirmation", None)
     else:
         tool_context.state.pop("latest_multiseed_confirmation", None)
 
@@ -614,6 +650,7 @@ def evaluate_and_update_fn(tool_context) -> str:
         tool_context.state["best_miss_rate"]        = float(metrics.miss_rate)
         tool_context.state["best_roc_auc"]          = float(metrics.roc_auc)
         tool_context.state["best_prob_gap"]         = float(metrics.prob_gap)
+        tool_context.state["best_selection_evaluation"] = selection_evaluation
         tool_context.state["best_pipeline_script"] = script
         tool_context.state["no_improve_count"]     = 0
         no_improve = 0
@@ -672,13 +709,18 @@ def evaluate_and_update_fn(tool_context) -> str:
         "current_best_overkill": tool_context.state.get("best_overkill_rate", 1.0),
         "no_improve_count":   no_improve,
         "metrics":         metrics_to_dict(metrics) if metrics else None,
+        "smoke_metrics":    smoke_record["metrics"],
+        "smoke_score":      smoke_record["score"],
+        "smoke_diagnostics": smoke_record["diagnostics"],
+        "full_run_executed": True,
+        "full_run_reason":  "full_run_after_smoke",
         "error_analysis_checkpoint": str(error_analysis_path),
         "error_analysis_available": error_analysis.get("available", False),
         "threshold_curve": threshold_curve,
         "probe_metrics": probe_metrics,
         "probe_rejection_reason": probe_rejection_reason,
         "prediction_verification": prediction_verification,
-        "multiseed_confirmation": multiseed_results,
+        AVERAGED_EVALUATION_KEY: selection_evaluation,
         "refinement_population_count": len(tool_context.state.get("refinement_population", []) or []),
         "stdout_tail":     result.stdout[-3000:],
         "stderr_tail":     result.stderr[-1000:],

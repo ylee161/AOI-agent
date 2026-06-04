@@ -70,6 +70,84 @@ class AcceptanceScoringTests(unittest.TestCase):
         self.assertTrue(is_acceptance_improvement(new, current))
 
 
+class AveragedCandidateSelectionTests(unittest.TestCase):
+    def test_l0_selection_prefers_better_average_over_better_single_seed(self):
+        from mle_star_agent.phases.phase1_init.merger_agent import _select_best_successful_candidate
+
+        noisy_single_seed_winner = {
+            "name": "noisy_single_seed_winner",
+            "status": "success",
+            "metrics": {
+                "accuracy": 0.94,
+                "ng_recall": 1.0,
+                "miss_rate": 0.0,
+                "overkill_rate": 0.09,
+                "f1": 0.91,
+            },
+            "selection_evaluation": {
+                "status": "success",
+                "metrics": {
+                    "accuracy": 0.90,
+                    "ng_recall": 0.94,
+                    "miss_rate": 0.06,
+                    "overkill_rate": 0.09,
+                    "f1": 0.86,
+                },
+            },
+        }
+        better_average = {
+            "name": "better_average",
+            "status": "success",
+            "metrics": {
+                "accuracy": 0.91,
+                "ng_recall": 0.97,
+                "miss_rate": 0.03,
+                "overkill_rate": 0.08,
+                "f1": 0.88,
+            },
+            "selection_evaluation": {
+                "status": "success",
+                "metrics": {
+                    "accuracy": 0.93,
+                    "ng_recall": 0.98,
+                    "miss_rate": 0.02,
+                    "overkill_rate": 0.08,
+                    "f1": 0.90,
+                },
+            },
+        }
+
+        best = _select_best_successful_candidate([noisy_single_seed_winner, better_average])
+
+        self.assertEqual(best["name"], "better_average")
+        self.assertEqual(best["selection_metrics"]["miss_rate"], 0.02)
+
+    def test_incomplete_average_does_not_override_single_seed_metrics(self):
+        from mle_star_agent.shared.selection_metrics import selection_metrics_for_record
+
+        candidate = {
+            "metrics": {
+                "accuracy": 0.91,
+                "ng_recall": 0.97,
+                "miss_rate": 0.03,
+                "overkill_rate": 0.08,
+                "f1": 0.88,
+            },
+            "selection_evaluation": {
+                "status": "failed",
+                "metrics": {
+                    "accuracy": 0.99,
+                    "ng_recall": 1.0,
+                    "miss_rate": 0.0,
+                    "overkill_rate": 0.0,
+                    "f1": 1.0,
+                },
+            },
+        }
+
+        self.assertEqual(selection_metrics_for_record(candidate)["miss_rate"], 0.03)
+
+
 class AblationCompletenessTests(unittest.TestCase):
     def test_ablation_plan_covers_overkill_and_calibration_failure_modes(self):
         from mle_star_agent.phases.phase2_refinement.ablation_agent import ABLATION_VARIANTS
@@ -245,6 +323,45 @@ class ThresholdCurveEvidenceTests(unittest.TestCase):
         self.assertFalse(module._requires_multiseed_confirmation(loose_overkill, improved=True))
         self.assertFalse(module._requires_multiseed_confirmation(still_bad, improved=True))
         self.assertFalse(module._requires_multiseed_confirmation(promising, improved=False))
+
+    def test_phase2_uses_average_before_accepting_single_seed_improvement(self):
+        import importlib
+
+        module = importlib.import_module("mle_star_agent.phases.phase2_refinement.evaluator_agent")
+
+        current = {
+            "accuracy": 0.93,
+            "ng_recall": 0.98,
+            "miss_rate": 0.02,
+            "overkill_rate": 0.08,
+            "f1": 0.90,
+        }
+        noisy_single_seed = {
+            "accuracy": 0.94,
+            "ng_recall": 1.0,
+            "miss_rate": 0.0,
+            "overkill_rate": 0.08,
+            "f1": 0.92,
+        }
+        worse_average = {
+            "accuracy": 0.90,
+            "ng_recall": 0.94,
+            "miss_rate": 0.06,
+            "overkill_rate": 0.08,
+            "f1": 0.86,
+        }
+
+        improved, selected_metrics, status = module._confirm_improvement_with_selection_average(
+            script="print('stub')",
+            metrics=noisy_single_seed,
+            current_metrics=current,
+            initially_improved=True,
+            run_average=lambda _script: (worse_average, [{"seed": 42}, {"seed": 101}, {"seed": 202}]),
+        )
+
+        self.assertFalse(improved)
+        self.assertEqual(selected_metrics["miss_rate"], 0.06)
+        self.assertEqual(status["status"], "success")
 
     def test_refinement_population_archives_lower_overkill_nonbest_candidate(self):
         import importlib

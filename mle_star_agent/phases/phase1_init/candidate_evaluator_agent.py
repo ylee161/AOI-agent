@@ -18,6 +18,15 @@ from mle_star_agent.shared.checkpoint_io import (
     save_checkpoint,
 )
 from mle_star_agent.shared.metrics_parser import metrics_to_dict, parse_metrics
+from mle_star_agent.shared.selection_metrics import (
+    AVERAGED_EVALUATION_KEY,
+    average_metrics_dicts,
+    build_selection_evaluation,
+)
+from mle_star_agent.shared.aoi_smoke_triage import (
+    build_smoke_diagnostics,
+    select_full_run_slots,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +34,109 @@ logger = logging.getLogger(__name__)
 # How many candidate slots to create.  Must match baseline_coder_agent output.
 # ---------------------------------------------------------------------------
 NUM_SLOTS = 3
+
+
+def _seed_env(seed: int) -> dict:
+    return {
+        "AOI_RANDOM_SEED": str(seed),
+        "PYTHONHASHSEED": str(seed),
+        "SEED": str(seed),
+    }
+
+
+def _seed_result(seed: int, result, metrics) -> dict:
+    return {
+        "seed": seed,
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "duration_ms": round(result.duration_ms, 1),
+        "metrics": metrics_to_dict(metrics) if metrics else None,
+        "stderr_tail": result.stderr[-1000:],
+    }
+
+
+def _run_selection_average(
+    script: str,
+    *,
+    context: str,
+    initial_seed_result: dict | None = None,
+) -> dict:
+    seed_results = []
+    if initial_seed_result is not None:
+        seed_results.append(initial_seed_result)
+    completed_seeds = {r.get("seed") for r in seed_results}
+    for seed in config.MULTISEED_CONFIRMATION_SEEDS:
+        if seed in completed_seeds:
+            continue
+        result = code_runner.run_script(
+            script,
+            timeout=config.TIMEOUT_SECONDS,
+            env=_seed_env(seed),
+        )
+        metrics = parse_metrics(result.stdout)
+        metrics = metric_guard.guard_metrics(
+            metrics,
+            result.duration_ms,
+            context=f"{context} selection seed={seed}",
+        )
+        seed_results.append(_seed_result(seed, result, metrics))
+
+    successful = [r["metrics"] for r in seed_results if r.get("metrics") is not None]
+    averaged = (
+        average_metrics_dicts(successful)
+        if len(successful) == len(config.MULTISEED_CONFIRMATION_SEEDS)
+        else None
+    )
+    return build_selection_evaluation(
+        seeds=config.MULTISEED_CONFIRMATION_SEEDS,
+        seed_results=seed_results,
+        averaged_metrics=averaged,
+    )
+
+
+def _candidate_script_for_slot(tool_context, slot_index: int) -> str:
+    scripts = tool_context.state.get("candidate_scripts", [])
+    if slot_index >= len(scripts):
+        return ""
+    return scripts[slot_index].get("script", "")
+
+
+def _run_full_candidate_evaluation(result_dict: dict, script_text: str, reason: str) -> dict:
+    slot_index = int(result_dict.get("slot", -1))
+    initial_seed = config.MULTISEED_CONFIRMATION_SEEDS[0]
+    result = code_runner.run_script(
+        script_text,
+        timeout=config.TIMEOUT_SECONDS,
+        env=_seed_env(initial_seed),
+    )
+    metrics = parse_metrics(result.stdout)
+    metrics = metric_guard.guard_metrics(
+        metrics, result.duration_ms, context=f"phase1 candidate slot {slot_index}"
+    )
+
+    selection_evaluation = None
+    status = "success" if (result.returncode == 0 and metrics is not None) else "failed"
+    if status == "success":
+        selection_evaluation = _run_selection_average(
+            script_text,
+            context=f"phase1 candidate slot {slot_index}",
+            initial_seed_result=_seed_result(initial_seed, result, metrics),
+        )
+
+    updated = dict(result_dict)
+    updated.update({
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "duration_ms": round(result.duration_ms, 1),
+        "stdout_tail": result.stdout[-3000:],
+        "stderr_tail": result.stderr[-1000:],
+        "metrics": metrics_to_dict(metrics) if metrics else None,
+        AVERAGED_EVALUATION_KEY: selection_evaluation,
+        "status": status,
+        "full_run_executed": True,
+        "full_run_reason": reason,
+    })
+    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -96,44 +208,85 @@ def _make_run_slot_fn(slot_index: int):
         script_name = candidate.get("name", f"candidate_{slot_index}")
         architecture = candidate.get("architecture", "")
 
-        logger.info("Running candidate slot %d: %s", slot_index, script_name)
-        result = code_runner.run_script(script_text, timeout=config.TIMEOUT_SECONDS)
-
-        metrics = parse_metrics(result.stdout)
-        # Persistence-boundary guard: drop degenerate runs (dummy/empty split,
-        # implausibly fast, no separability) so they never enter candidate_scores.
-        metrics = metric_guard.guard_metrics(
-            metrics, result.duration_ms, context=f"phase1 candidate slot {slot_index}"
+        logger.info("Smoke-running candidate slot %d: %s", slot_index, script_name)
+        smoke_result = code_runner.run_script(
+            script_text,
+            timeout=config.TIMEOUT_SECONDS,
+            env=_seed_env(42),
+            debug_mode=True,
         )
+
+        smoke = build_smoke_diagnostics(
+            smoke_result.stdout,
+            smoke_result.duration_ms,
+            context=f"phase1 candidate slot {slot_index} smoke",
+        )
+        smoke_metrics = smoke.get("metrics")
+        smoke_score = smoke.get("score")
+        smoke_diagnostics = {
+            "probe_metrics": smoke.get("probe_metrics"),
+            "calibration_stats": smoke.get("calibration_stats"),
+            "threshold_curve": smoke.get("threshold_curve"),
+            "epoch_logs": smoke.get("epoch_logs"),
+            "early_collapse": smoke.get("early_collapse"),
+        }
+        if smoke_result.returncode != 0:
+            status = "failed"
+            full_run_reason = "smoke_check_failed"
+        elif smoke.get("pruned"):
+            status = "smoke_pruned"
+            full_run_reason = smoke.get("prune_reason") or "smoke_pruned_egregious"
+        else:
+            status = "smoke_pending_full"
+            full_run_reason = "pending_smoke_rank"
 
         result_dict = {
             "slot": slot_index,
             "name": script_name,
             "architecture": architecture,
-            "returncode": result.returncode,
-            "timed_out": result.timed_out,
-            "duration_ms": round(result.duration_ms, 1),
-            "stdout_tail": result.stdout[-3000:],
-            "stderr_tail": result.stderr[-1000:],
-            "metrics": metrics_to_dict(metrics) if metrics else None,
-            "status": "success" if (result.returncode == 0 and metrics is not None) else "failed",
+            "returncode": smoke_result.returncode,
+            "timed_out": smoke_result.timed_out,
+            "duration_ms": round(smoke_result.duration_ms, 1),
+            "stdout_tail": smoke_result.stdout[-3000:],
+            "stderr_tail": smoke_result.stderr[-1000:],
+            "metrics": None,
+            AVERAGED_EVALUATION_KEY: None,
+            "status": status,
+            "smoke_metrics": smoke_metrics,
+            "smoke_score": smoke_score,
+            "smoke_diagnostics": smoke_diagnostics,
+            "full_run_executed": False,
+            "full_run_reason": full_run_reason,
         }
         tool_context.state[f"candidate_result_{slot_index}"] = result_dict
 
         # Rate-limit delay between sequential LLM-heavy steps
         time.sleep(config.RATE_LIMIT_DELAY_SECONDS)
 
-        if metrics:
+        if status == "smoke_pending_full":
+            if smoke_metrics:
+                return (
+                    f"Slot {slot_index} ({script_name}): smoke score={smoke_score:.3f}, "
+                    f"ng_recall={smoke_metrics.get('ng_recall'):.3f}, "
+                    f"miss_rate={smoke_metrics.get('miss_rate'):.3f}, "
+                    f"overkill_rate={smoke_metrics.get('overkill_rate'):.3f}. "
+                    "Awaiting batch ranking for full run."
+                )
             return (
-                f"Slot {slot_index} ({script_name}): "
-                f"accuracy={metrics.accuracy:.3f}, ng_recall={metrics.ng_recall:.3f}, "
-                f"miss_rate={metrics.miss_rate:.3f}, overkill_rate={metrics.overkill_rate:.3f}, "
-                f"f1={metrics.f1:.3f}, threshold={metrics.threshold}"
+                f"Slot {slot_index} ({script_name}): smoke metrics missing; "
+                "conservative fallback will full-run it."
+            )
+        if status == "smoke_pruned":
+            return (
+                f"Slot {slot_index} ({script_name}): smoke-pruned "
+                f"(score={smoke_score:.3f}, overkill={smoke_metrics.get('overkill_rate'):.3f}, "
+                f"ng_recall={smoke_metrics.get('ng_recall'):.3f}); full run skipped."
             )
         return (
             f"Slot {slot_index} ({script_name}): FAILED "
-            f"(rc={result.returncode}, timed_out={result.timed_out}). "
-            f"stderr: {result.stderr[-300:]}"
+            f"(rc={smoke_result.returncode}, timed_out={smoke_result.timed_out}) "
+            "in smoke run. "
+            f"stderr: {smoke_result.stderr[-300:]}"
         )
 
     run_slot_fn.__name__ = f"run_candidate_slot_{slot_index}_fn"
@@ -210,6 +363,27 @@ def consolidate_candidate_scores_fn(tool_context) -> str:
         if result is not None:
             scores.append(result)
 
+    selected_slots = select_full_run_slots(scores)
+    updated_scores = []
+    for result in scores:
+        slot = result.get("slot")
+        if slot in selected_slots and result.get("status") == "smoke_pending_full":
+            script_text = result.get("script") or _candidate_script_for_slot(tool_context, int(slot))
+            result = _run_full_candidate_evaluation(
+                result,
+                script_text,
+                selected_slots[int(slot)],
+            )
+            tool_context.state[f"candidate_result_{slot}"] = result
+        elif result.get("status") == "smoke_pending_full":
+            result = dict(result)
+            result["status"] = "smoke_deferred"
+            result["full_run_executed"] = False
+            result["full_run_reason"] = "below_smoke_rank_cutoff"
+            tool_context.state[f"candidate_result_{slot}"] = result
+        updated_scores.append(result)
+    scores = updated_scores
+
     tool_context.state["candidate_scores"] = scores
     config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     save_checkpoint(config.CKPT_CANDIDATE_SCORES, {"scores": scores})
@@ -220,15 +394,23 @@ def consolidate_candidate_scores_fn(tool_context) -> str:
     summary_rows = []
     for s in scores:
         m = s.get("metrics") or {}
+        selection_eval = s.get(AVERAGED_EVALUATION_KEY) or {}
+        selection_metrics = selection_eval.get("metrics") if selection_eval.get("status") == "success" else None
         summary_rows.append({
             "name": s.get("name"),
             "status": s.get("status"),
+            "smoke_score": s.get("smoke_score"),
+            "smoke_metrics": s.get("smoke_metrics"),
+            "full_run_executed": s.get("full_run_executed"),
+            "full_run_reason": s.get("full_run_reason"),
             "accuracy": m.get("accuracy"),
             "ng_recall": m.get("ng_recall"),
             "miss_rate": m.get("miss_rate"),
             "overkill_rate": m.get("overkill_rate"),
             "f1": m.get("f1"),
             "threshold": m.get("threshold"),
+            "selection_status": selection_eval.get("status"),
+            "selection_metrics": selection_metrics,
         })
 
     return (
@@ -254,7 +436,8 @@ def _make_slot_agent(slot_index: int) -> LlmAgent:
 
     instruction = f"""You are Candidate Evaluator Slot {slot_index}.
 
-Your job is to validate, then execute the candidate script at slot index {slot_index}.
+Your job is to validate, then smoke-run the candidate script at slot index {slot_index}.
+The aggregator ranks the smoke results and performs selected full runs later.
 
 ## Steps (follow in order)
 
@@ -277,12 +460,14 @@ First call `check_validation_cache_fn` with the script text from Step 1.
     script and status "VALIDATION_FAILED". Call `run_candidate_slot_{slot_index}_fn` to
     record the failure, then stop.
 
-### STEP 3 — Run
+### STEP 3 — Smoke run
 Call `run_candidate_slot_{slot_index}_fn`. This reads the (possibly updated) script from
-state, executes it, parses METRICS, and writes `state["candidate_result_{slot_index}"]`.
+state, executes the accelerated debug smoke run, parses smoke METRICS/diagnostics, and
+writes `state["candidate_result_{slot_index}"]`. It does not perform the expensive full
+run; failed or conservatively pruned smoke runs are recorded as full-run skips.
 
 ### STEP 4 — Report
-Report the result: key metrics if successful, or the error summary if failed.
+Report the result: smoke score and key smoke metrics when present, or the error summary if failed.
 
 Do not loop or retry beyond what is described above.
 """
@@ -320,8 +505,10 @@ Steps:
 1. Call `consolidate_candidate_scores_fn`. It gathers all results, saves the checkpoint,
    and returns a SCORES: block containing a JSON summary of every candidate.
 2. Using the SCORES data returned by the tool (not from state directly), produce a
-   brief summary table: Name | Status | ng_recall | miss_rate | overkill_rate | f1 | threshold
-3. Identify the best candidate: lowest miss_rate first, then highest ng_recall, then highest f1.
+   brief summary table: Name | Status | smoke_score | full_run_executed | full_run_reason |
+   selection_status | ng_recall | miss_rate | overkill_rate | f1 | threshold.
+   When selection_metrics is present, report those averaged metrics as the decision metrics.
+3. Identify the best candidate using averaged selection_metrics when available.
 4. State the recommended best candidate by name.
 
 Do not write any new state keys — `consolidate_candidate_scores_fn` handles all state writes.

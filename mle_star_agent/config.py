@@ -100,6 +100,8 @@ PROBE_PROBABILITY_GAP_MIN = 0.05  # require NG mean probability to exceed G mean
 # run the full job (absence of parseable METRICS on 5% data is NOT evidence of a bad script).
 DEBUG_PREDICT_OVERKILL_MAX = 0.60   # abort only if the micro-run already false-rejects most G
 DEBUG_PREDICT_NG_RECALL_MIN = 0.50  # abort only on severe NG-recall collapse
+PHASE1_SMOKE_TOP_K = 2  # full-run the top smoke-ranked initial candidates
+PHASE1_SMOKE_UNCERTAINTY_BAND = 0.05  # also full-run candidates within this score gap
 
 # Execution
 TIMEOUT_SECONDS = 7200  # 2 hours — ResNet18 15-epoch CPU training takes ~45-60 min per script
