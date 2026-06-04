@@ -103,6 +103,14 @@ def run_script(
 ) -> RunResult:
     if debug_mode:
         script = apply_debug_patches(script)
+        debug_env = {
+            # Generated scripts use DRY_RUN to skip expensive prediction dumps.
+            # The DataLoader patch remains the actual 5% sample limiter.
+            "DRY_RUN": "1",
+            "DRY_RUN_EPOCHS": str(int(config.CURVE_ABORT_DEBUG_EPOCHS)),
+            "DRY_RUN_SAMPLES": "999999",
+        }
+        env = {**debug_env, **(env or {})}
         # Debug runs are a fast smoke-check: cap the timeout regardless of config.
         timeout = min(timeout, config.DEBUG_CHECK_TIMEOUT_SECONDS)
 

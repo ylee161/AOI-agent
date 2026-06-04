@@ -58,6 +58,26 @@ def test_debug_patches_do_not_mutate_original_script():
     assert "num_epochs = 50" not in patched
 
 
+def test_debug_mode_sets_dry_run_env_to_avoid_prediction_dump_crashes():
+    """Generated scripts often guard expensive prediction dumps with DRY_RUN.
+    Debug smoke runs must enable that guard so 5%-capped loaders do not leave
+    full-size sample lists paired with short probability arrays."""
+    script = """
+import os
+DRY_RUN = os.getenv("DRY_RUN") == "1"
+DRY_RUN_EPOCHS = int(os.getenv("DRY_RUN_EPOCHS", "1"))
+print(f"DRY_RUN={DRY_RUN} EPOCHS={DRY_RUN_EPOCHS}")
+print('METRICS: {"tp": 5, "tn": 5, "fp": 0, "fn": 0, "threshold": 0.5, "avg_latency_ms": 1, "prob_gap": 0.2}')
+if not DRY_RUN:
+    raise IndexError("prediction dump mismatch")
+"""
+    result = code_runner.run_script(script, debug_mode=True)
+
+    assert result.returncode == 0
+    assert f"DRY_RUN=True EPOCHS={config.CURVE_ABORT_DEBUG_EPOCHS}" in result.stdout
+    assert "METRICS:" in result.stdout
+
+
 def test_epoch_regex_preserves_variable_name():
     """Epoch rewrite keeps the LHS name and only changes the integer literal."""
     cap = config.CURVE_ABORT_DEBUG_EPOCHS
