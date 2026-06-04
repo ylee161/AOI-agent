@@ -14,6 +14,7 @@ from mle_star_agent.shared.callbacks import (
     rate_limit_retry_callback,
 )
 from mle_star_agent.shared.analytical_state import analytical_state_line
+from mle_star_agent.shared.kb_semantic import rank_records_by_similarity
 from mle_star_agent.shared.checkpoint_io import checkpoint_exists, load_checkpoint, save_checkpoint
 from mle_star_agent.shared.small_data_strategy_validator import KNOWN_FAILED_STRATEGY_FINGERPRINTS
 from mle_star_agent.phases.phase2_refinement import fusion
@@ -209,11 +210,16 @@ def _kb_record_tags(record: dict) -> list:
 
 
 def retrieve_kb_records(records: list, failure_mode: str, k: int = 6) -> list:
-    """Return recent KB records matching ``failure_mode``, with recent backfill.
+    """Return KB records relevant to ``failure_mode`` (hybrid exact + semantic).
 
-    The persistent KB is append-ordered. Select the most recent matching records,
-    backfill with the most recent non-matching records if needed, then restore
-    append order for the returned top-K slice. Never raises on malformed input.
+    The persistent KB is append-ordered. Exact tag matches take priority (most
+    recent first), preserving prior behavior. Remaining top-K slots are then
+    filled by TF-IDF semantic similarity to ``failure_mode`` over the non-matching
+    records, so past runs that hit a related-but-differently-worded failure still
+    surface. If semantic ranking is not meaningful (too few records, no shared
+    terms, or scikit-learn unavailable), backfill falls back to the original
+    most-recent behavior unchanged. Append order is restored for the returned
+    slice. Never raises on malformed input.
     """
     try:
         limit = int(k)
@@ -244,8 +250,15 @@ def retrieve_kb_records(records: list, failure_mode: str, k: int = 6) -> list:
             others.append((idx, record))
 
     selected = matches[-limit:]
-    if len(selected) < limit:
-        selected.extend(others[-(limit - len(selected)):])
+    remaining = limit - len(selected)
+    if remaining > 0 and others:
+        # Prefer semantically-relevant non-matching records over pure recency.
+        ranked = rank_records_by_similarity([record for _, record in others], wanted)
+        if ranked is not None:
+            selected.extend(others[pos] for pos in ranked[:remaining])
+        else:
+            # Fallback: original most-recent backfill, unchanged.
+            selected.extend(others[-remaining:])
     selected.sort(key=lambda item: item[0])
     return [record for _, record in selected[-limit:]]
 
