@@ -262,6 +262,25 @@ Call `save_ensemble_strategy_fn` with:
 
 Implement the chosen strategy as a single self-contained Python script.
 
+**MANDATORY — 9-channel first-conv initialisation (stereo CNN backbones only):**
+When adapting any pretrained CNN backbone (EfficientNet, ResNet, MobileNet, etc.) to
+accept 9-channel stereo input, you MUST use the `/3` repeat trick — do NOT zero-pad
+the extra channels. Zero-initialising channels 4–9 produces catastrophic overkill at
+probe time (empirically proven: overkill > 0.95 every time) because the model has no
+stereo signal and outputs high uniform probabilities for all samples.
+
+Correct implementation (copy exactly):
+```python
+old_conv = backbone.conv1  # or features[0][0] for EfficientNet
+new_conv = nn.Conv2d(9, old_conv.out_channels, old_conv.kernel_size,
+                     old_conv.stride, old_conv.padding, bias=False)
+with torch.no_grad():
+    new_conv.weight.data = old_conv.weight.data.repeat(1, 3, 1, 1) / 3.0
+backbone.conv1 = new_conv  # replace the layer
+```
+This divides pretrained RGB weights by 3 and tiles them across all 3 channel groups
+(L, R, |L-R|), so the backbone starts with meaningful signal from all 9 channels.
+
 Required properties:
 - Load both _L and _R stereo images for all components that use visual input
 - Load Excel labels via the split in `__DATA_SPLIT_PATH__` — the script runs as a standalone process with no ADK state access. Use: `import json; data_split = json.load(open("__DATA_SPLIT_PATH__"))`

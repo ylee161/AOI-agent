@@ -394,6 +394,12 @@ Starting from the BEST_PIPELINE_SCRIPT returned by `load_refinement_context_fn`,
 ONLY the planned changes to the target_component block.  Do NOT change unrelated components.
 
 The script must:
+- **9-channel first-conv init (MANDATORY for CNN backbones)**: use the `/3` repeat trick —
+  NEVER zero-pad channels 4–9. Zero-init causes catastrophic overkill > 0.95 at probe time
+  (empirically proven on this dataset). Correct code:
+  ```python
+  new_conv.weight.data = old_conv.weight.data.repeat(1, 3, 1, 1) / 3.0
+  ```
 - Load both _L and _R stereo images (unless a prior ablation proved stereo is not useful)
 - Load Excel labels
 - Train with weighted loss (unless explicitly changing this)
