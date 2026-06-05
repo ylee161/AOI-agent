@@ -87,9 +87,9 @@ REFINEMENT_POPULATION_MAX = 5  # keep a small Pareto-style archive for non-linea
 ERROR_ANALYSIS_SAMPLE_CAP = 20  # max FP/FN samples surfaced into an LLM prompt (full set stays on disk)
 VALIDATION_CACHE_MAX = 50       # cap on the in-state {sha256: status} validation cache
 TRIED_APPROACHES_RECENT_K = 8   # full recent tried_approaches entries shown in the planner prompt (rest aggregated)
-PROBE_OVERKILL_REJECT_MAX = 0.50  # reject cheap probes that already false-reject most G samples
+PROBE_OVERKILL_REJECT_MAX = 0.90  # reject only catastrophic probes (ConvNeXt-style ≥90% overkill)
 PROBE_NG_RECALL_REJECT_MIN = 0.80  # reject probes with severe NG recall collapse
-PROBE_PROBABILITY_GAP_MIN = 0.05  # require NG mean probability to exceed G mean by this much
+PROBE_PROBABILITY_GAP_MIN = 0.01  # only block truly flat models (gap≈0); let borderline cases train
 
 # KompeteAI-style predictive early-abort on the debug smoke-run (max_epochs=1, 5% data).
 # These gates run on the METRICS the *micro-run* already prints, so an obviously-bad

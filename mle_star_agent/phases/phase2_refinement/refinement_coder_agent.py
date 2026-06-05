@@ -310,9 +310,13 @@ Translate the strategy name and description into specific code modifications. Co
   METRICS so the next diagnosis can inspect the actual mistakes.
 - Before full training, run a cheap probe on the capped/early training signal and print
   `PROBE_METRICS: {...}`. Include at least `ng_recall`, `overkill_rate`, `G_prob_mean`,
-  `NG_prob_mean`, and `should_continue`. If the probe shows catastrophic overkill,
-  recall collapse, or no G/NG probability separation, print `should_continue: false`
-  and exit before the full training loop.
+  `NG_prob_mean`, and `should_continue`. Only set `should_continue: false` for
+  **catastrophic** failures sustained across ALL probe epochs: overkill > 0.90 at
+  threshold 0.5 (model classifies nearly all G as NG), recall collapse ng_recall < 0.05
+  at threshold 0.5 (model misses nearly all NG), or truly flat predictions
+  `abs(NG_prob_mean - G_prob_mean) < 0.01` (gap so small no threshold can separate).
+  Do NOT abort on borderline overkill (0.50–0.90) or borderline prob_gap (0.01–0.05)
+  — those cases often recover during full training with the weighted loss and threshold sweep.
 - If `state["best_overkill_rate"] > 0.08` **AND** `state["best_miss_rate"] <= 0.03`,
   the refined script MUST implement dynamic false-positive loss control as executable
   code: `fp_weight = 1.0 + 5.0 * max(0, best_overkill_rate - 0.08)`. Apply this FP
