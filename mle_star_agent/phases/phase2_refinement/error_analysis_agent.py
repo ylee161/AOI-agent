@@ -18,6 +18,14 @@ from mle_star_agent.shared.checkpoint_lineage import lineage_matches, stable_jso
 logger = logging.getLogger(__name__)
 
 
+def _state_pop(state, key, default=None):
+    """ADK State doesn't support .pop() or del — null the key out instead."""
+    val = state.get(key, default)
+    if key in state:
+        state[key] = None
+    return val
+
+
 def _evaluated_inner_iteration(state: dict) -> int:
     return max(0, int(state.get("inner_iteration", 0)) - 1)
 
@@ -60,7 +68,7 @@ def _allow_no_evidence(tool_context, reason: str) -> str:
         return _block_no_evidence(tool_context, reason)
     tool_context.state["error_analysis_instrumentation_required"] = True
     tool_context.state["error_analysis_repair_attempted"] = True
-    tool_context.state.pop("error_analysis_blocked", None)
+    _state_pop(tool_context.state, "error_analysis_blocked")
     logger.warning("Gate: allowing iteration without evidence — %s", reason)
     return (
         f"ALLOW_NO_EVIDENCE: {reason} "
@@ -118,9 +126,9 @@ def check_error_analysis_gate_fn(tool_context) -> str:
             "Proceeding — treat FP/FN counts as approximate."
         )
 
-    tool_context.state.pop("error_analysis_instrumentation_required", None)
-    tool_context.state.pop("error_analysis_repair_attempted", None)
-    tool_context.state.pop("error_analysis_blocked", None)
+    _state_pop(tool_context.state, "error_analysis_instrumentation_required")
+    _state_pop(tool_context.state, "error_analysis_repair_attempted")
+    _state_pop(tool_context.state, "error_analysis_blocked")
     return "ALLOW: valid error_analysis_report present for next refinement."
 
 

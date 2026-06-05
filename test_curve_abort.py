@@ -6,13 +6,21 @@ power-law y = a + b * t^(-c) to that val_ng_recall curve and prunes the full run
 ONLY when the projected final is CONFIDENTLY worse than the best NG recall so far
 AND the fit is trustworthy. Everything else falls through to the full run.
 
+The evaluator additionally projects the per-epoch val_overkill curve and prunes
+ONLY when BOTH the ng_recall projection AND the overkill projection are
+confidently worse than the best (AND logic): a doomed overkill trajectory with a
+healthy ng_recall trajectory (or vice-versa) still gets the full run, since a
+single bad axis is often threshold-fixable.
+
 Covered here:
   - rising-then-plateau curve -> projects HIGH (no abort),
   - monotonically-bad curve   -> projects LOW with a good fit (abort),
   - noisy / 2-point curve      -> no usable projection (no abort),
   - the config gates are conservative,
   - the debug micro-run is patched to the multi-epoch cap,
-  - end-to-end wiring: a doomed curve prunes; a healthy/early one does not.
+  - end-to-end wiring: a doomed (both-bad) curve prunes; a healthy/early one does not,
+  - AND logic: bad-overkill-only and bad-ng_recall-only curves both fall through,
+  - a too-short overkill series falls through (safe-by-default).
 """
 import importlib
 import json
@@ -84,6 +92,10 @@ def test_curve_abort_config_is_conservative():
     assert config.CURVE_ABORT_DEBUG_EPOCHS == 4
     assert config.CURVE_ABORT_MARGIN == 0.05
     assert config.CURVE_ABORT_MIN_FIT == 0.70
+    assert config.CURVE_ABORT_OVERKILL_MARGIN == 0.10
+    # overkill is noisier on 5%-data micro-runs, so its margin must be looser
+    # (>=) than ng_recall's — never reuse CURVE_ABORT_MARGIN for overkill.
+    assert config.CURVE_ABORT_OVERKILL_MARGIN >= config.CURVE_ABORT_MARGIN
     # the debug curve must actually have enough points to fit
     assert config.CURVE_ABORT_DEBUG_EPOCHS >= config.CURVE_ABORT_MIN_EPOCHS
 
@@ -137,13 +149,18 @@ def _metrics_line(tp, tn, fp, fn, prob_gap=0.2):
     )
 
 
-def _epoch_lines(ng_recalls, overkill=0.05):
-    """Render EPOCH_LOG lines with the given per-epoch val_ng_recall series."""
+def _epoch_lines(ng_recalls, overkill=0.05, overkills=None):
+    """Render EPOCH_LOG lines with the given per-epoch val_ng_recall series.
+
+    ``overkills``, when provided, is a per-epoch val_overkill series the same
+    length as ``ng_recalls``; otherwise the constant ``overkill`` is emitted for
+    every epoch (a flat curve, which the power-law fit treats as degenerate)."""
+    series = overkills if overkills is not None else [overkill] * len(ng_recalls)
     out = []
-    for i, ng in enumerate(ng_recalls, start=1):
+    for i, (ng, ov) in enumerate(zip(ng_recalls, series), start=1):
         out.append(
             'EPOCH_LOG: {"epoch": %d, "train_loss": 0.1, "val_loss": 0.1, '
-            '"val_ng_recall": %s, "val_overkill": %s}' % (i, ng, overkill)
+            '"val_ng_recall": %s, "val_overkill": %s}' % (i, ng, ov)
         )
     return "\n".join(out)
 
@@ -185,11 +202,15 @@ def _run_evaluator(debug_stdout, debug_duration_ms=5000.0):
 
 def test_doomed_curve_is_pruned():
     """A debug curve decaying to a low NG-recall floor (well below best 0.90)
-    with a clean fit prunes the full run."""
+    AND a rising overkill curve (well above best 0.05) — both with clean fits —
+    prunes the full run. Both trajectories must project bad for the AND gate."""
     stdout = (
         _metrics_line(tp=70, tn=95, fp=5, fn=30)  # not egregious -> survives DEBUG_PREDICT
         + "\n"
-        + _epoch_lines([0.45, 0.30, 0.22, 0.18])
+        + _epoch_lines(
+            [0.45, 0.30, 0.22, 0.18],
+            overkills=[0.18, 0.30, 0.38, 0.42],  # rising toward ~0.45 >> best 0.05
+        )
     )
     message, call_count, saved, context = _run_evaluator(stdout)
     assert call_count == 1, "full run must NOT execute after a curve abort"
@@ -200,8 +221,60 @@ def test_doomed_curve_is_pruned():
     assert saved["full_run_reason"] == "curve_abort_projected_low"
     assert saved["projected_ng_recall"] < 0.90
     assert saved["curve_fit_quality"] >= config.CURVE_ABORT_MIN_FIT
+    assert saved["projected_overkill"] > 0.05 + config.CURVE_ABORT_OVERKILL_MARGIN
+    assert saved["overkill_curve_fit_quality"] >= config.CURVE_ABORT_MIN_FIT
     assert context.state["inner_iteration"] == 1
     assert context.state["no_improve_count"] == 1
+
+
+def test_bad_overkill_but_good_ng_recall_is_not_pruned():
+    """AND logic: a debug curve with a doomed overkill trajectory (rising well
+    above best 0.05) but a HEALTHY ng_recall trajectory (rising to a high
+    plateau) must NOT prune — overkill alone is threshold-fixable, so the
+    candidate falls through to the full run."""
+    stdout = (
+        _metrics_line(tp=70, tn=95, fp=5, fn=30)
+        + "\n"
+        + _epoch_lines(
+            [0.80, 0.90, 0.95, 0.97],            # healthy ng_recall -> projects high
+            overkills=[0.18, 0.30, 0.38, 0.42],  # doomed overkill -> projects high
+        )
+    )
+    message, call_count, saved, _ = _run_evaluator(stdout)
+    assert call_count >= 2, "bad overkill alone must NOT prune (full run proceeds)"
+    assert "CURVE ABORT PRUNED" not in message
+
+
+def test_bad_ng_recall_but_good_overkill_is_not_pruned():
+    """AND logic: a doomed ng_recall trajectory with a HEALTHY (low, flat)
+    overkill trajectory must NOT prune — only one of the two projections is bad,
+    so the run still gets its full execution."""
+    stdout = (
+        _metrics_line(tp=70, tn=95, fp=5, fn=30)
+        + "\n"
+        + _epoch_lines([0.45, 0.30, 0.22, 0.18], overkill=0.05)  # flat, healthy overkill
+    )
+    message, call_count, saved, _ = _run_evaluator(stdout)
+    assert call_count >= 2, "bad ng_recall with good overkill must NOT prune under AND"
+    assert "CURVE ABORT PRUNED" not in message
+
+
+def test_overkill_too_few_points_falls_through():
+    """Both ng_recall and overkill are doomed, but the overkill series has only 2
+    points (< CURVE_ABORT_MIN_EPOCHS). Missing ng_recall on those same epochs is
+    irrelevant here — the overkill projection returns None, so the AND gate can't
+    fire and the candidate falls through to the full run (safe-by-default)."""
+    # Render a 4-epoch ng_recall curve but emit val_overkill on only the first 2.
+    lines = [
+        'EPOCH_LOG: {"epoch": 1, "val_ng_recall": 0.45, "val_overkill": 0.20}',
+        'EPOCH_LOG: {"epoch": 2, "val_ng_recall": 0.30, "val_overkill": 0.40}',
+        'EPOCH_LOG: {"epoch": 3, "val_ng_recall": 0.22}',
+        'EPOCH_LOG: {"epoch": 4, "val_ng_recall": 0.18}',
+    ]
+    stdout = _metrics_line(tp=70, tn=95, fp=5, fn=30) + "\n" + "\n".join(lines)
+    message, call_count, saved, _ = _run_evaluator(stdout)
+    assert call_count >= 2, "too-short overkill curve must fall through to full run"
+    assert "CURVE ABORT PRUNED" not in message
 
 
 def test_healthy_curve_is_not_pruned():
@@ -276,6 +349,9 @@ if __name__ == "__main__":
     test_curve_abort_config_is_conservative()
     test_debug_micro_run_emits_multi_epoch_curve()
     test_doomed_curve_is_pruned()
+    test_bad_overkill_but_good_ng_recall_is_not_pruned()
+    test_bad_ng_recall_but_good_overkill_is_not_pruned()
+    test_overkill_too_few_points_falls_through()
     test_healthy_curve_is_not_pruned()
     test_too_few_epochs_is_not_pruned()
     test_no_baseline_never_curve_aborts()

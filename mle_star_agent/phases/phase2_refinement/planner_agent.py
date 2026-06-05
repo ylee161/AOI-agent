@@ -3,6 +3,14 @@ import logging
 import re
 from pathlib import Path
 
+
+def _state_pop(state, key, default=None):
+    """ADK State doesn't support .pop() or del — null the key out instead."""
+    val = state.get(key, default)
+    if key in state:
+        state[key] = None
+    return val
+
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
 
@@ -400,7 +408,7 @@ def load_tried_approaches_fn(tool_context) -> str:
         "selected_refinement_strategy_inner",
         "strategy_selection_reason",
     ):
-        tool_context.state.pop(key, None)
+        _state_pop(tool_context.state, key)
 
     existing = list(tool_context.state.get("tried_approaches", []) or [])
     checkpoint_history = []
@@ -867,7 +875,7 @@ def _consume_pending_fusion(tool_context) -> str | None:
     if not state.get("pending_fusion"):
         return None
     # Consume the flag regardless of outcome so it cannot leak into later cycles.
-    state.pop("pending_fusion", None)
+    _state_pop(state, "pending_fusion")
 
     members = fusion.top_fusion_members(state, k=2)
     if len(members) < 2:
@@ -920,7 +928,7 @@ def _consume_pending_warm_restart(tool_context) -> str | None:
     state = tool_context.state
     if not state.get("pending_warm_restart"):
         return None
-    state.pop("pending_warm_restart", None)
+    _state_pop(state, "pending_warm_restart")
 
     best_sha = (state.get("warm_restart_best_sha") or "").strip()
     if not best_sha:
@@ -1004,7 +1012,7 @@ def ensure_selected_strategy_fn(tool_context) -> str:
             "selected_refinement_strategy_inner",
             "strategy_selection_reason",
         ):
-            tool_context.state.pop(key, None)
+            _state_pop(tool_context.state, key)
 
     diagnosis = tool_context.state.get("diagnosis_report") or {}
     if not isinstance(diagnosis, dict):
@@ -1162,13 +1170,17 @@ Known failed strategy fingerprints are banned before candidate selection:
   perspective, affine, or any spatial transform targeted at the ROI region.
   AOI-safe augmentations (applied identically to L and R globally) are still
   allowed; ROI-specific geometric aug is not.
-- (`model_architecture`, `anomaly_detector`) — DEAD END (MG15/MG16). The
-  training-free per-board anomaly detector route (isolation forest, one-class SVM,
-  SVDD, autoencoder anomaly score, etc.) appeared to reach 0.78 AUC but this was
-  a board-pooling evaluation leak. Clean held-out AUC was 0.50 (random) with 83%
-  overkill. This entire family — any approach that treats defect detection as an
-  anomaly / out-of-distribution problem without supervised labels — is a dead end
-  on this dataset. Do NOT propose it under any reframing.
+- (`model_architecture`, `unsupervised_anomaly_detector`) — DEAD END (MG15/MG16).
+  The TRAINING-FREE / UNSUPERVISED per-board anomaly detector route (isolation
+  forest, one-class SVM, SVDD, autoencoder reconstruction-error score, etc.)
+  appeared to reach 0.78 AUC but this was a board-pooling evaluation leak. Clean
+  held-out AUC was 0.50 (random) with 83% overkill. Only the LABEL-FREE
+  anomaly / out-of-distribution framing is banned — do NOT propose it under any
+  reframing. This ban does NOT cover SUPERVISED anomaly-detection models trained
+  with the G/NG labels (e.g. PatchCore, EfficientAD): those learn from the labels,
+  are a mechanistically distinct route, and are allowed. Give them their own
+  mechanism_class (e.g. `patchcore`, `efficientad`) — not `anomaly_detector` or
+  `unsupervised_anomaly_detector` — so they are not caught by this fingerprint.
 - (`model_architecture`, `local_patch_mil`) — DEAD END (MG14). The
   local-patch / multiple-instance-learning route (sliding-window patch scores,
   MIL aggregation, patch-level supervision) reached AUC 0.45 (worse than random)

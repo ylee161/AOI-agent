@@ -11,7 +11,12 @@ from typing import Any, Optional
 
 from mle_star_agent import config
 from mle_star_agent.shared.acceptance_scoring import acceptance_distance, metrics_view
-from mle_star_agent.shared.metrics_parser import _extract_json_block
+from mle_star_agent.shared.metrics_parser import (
+    CALIBRATION_STATS_LABEL,
+    EPOCH_LOG_LABEL,
+    THRESHOLD_CURVE_LABEL,
+    _extract_json_block,
+)
 from mle_star_agent.shared.small_data_strategy_validator import KNOWN_FAILED_STRATEGY_FINGERPRINTS
 
 logger = logging.getLogger(__name__)
@@ -454,13 +459,13 @@ def _threshold_point_overkill(point: dict) -> float:
 
 def parse_calibration_stats(stdout: str) -> Optional[dict]:
     """Parse CALIBRATION_STATS: {...} from stdout."""
-    result = _extract_json_block(stdout, "CALIBRATION_STATS")
+    result = _extract_json_block(stdout, CALIBRATION_STATS_LABEL)
     return result if isinstance(result, dict) else None
 
 
 def parse_threshold_curve(stdout: str) -> Optional[list]:
     """Parse THRESHOLD_CURVE: [...] from stdout."""
-    match = re.search(r"THRESHOLD_CURVE:\s*(\[.*?\])", stdout, re.DOTALL)
+    match = re.search(rf"{THRESHOLD_CURVE_LABEL}:\s*(\[.*?\])", stdout, re.DOTALL)
     if not match:
         return None
     try:
@@ -472,7 +477,7 @@ def parse_threshold_curve(stdout: str) -> Optional[list]:
 def parse_epoch_logs(stdout: str) -> list:
     """Parse all EPOCH_LOG: {...} lines from stdout."""
     results = []
-    for match in re.finditer(r"EPOCH_LOG:\s*(\{.*?\})", stdout):
+    for match in re.finditer(rf"{EPOCH_LOG_LABEL}:\s*(\{{.*?\}})", stdout):
         try:
             results.append(json.loads(match.group(1)))
         except json.JSONDecodeError:

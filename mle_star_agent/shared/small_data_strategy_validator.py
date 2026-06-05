@@ -21,9 +21,15 @@ KNOWN_FAILED_STRATEGY_FINGERPRINTS = {
     # MG11: any geometric augmentation on the ROI crop collapses prob_gap
     # (v3_roi_centered_aug: val prob_gap 0.058 < 0.10 over-aug signature).
     ("augmentation", "roi_geometric_augmentation"),
-    # MG15/MG16: the training-free per-board anomaly detector route — the 0.78 AUC
-    # was a board-pooling eval leak; clean held-out AUC 0.50, 83% overkill.
-    ("model_architecture", "anomaly_detector"),
+    # MG15/MG16: the TRAINING-FREE / UNSUPERVISED per-board anomaly detector route
+    # (isolation forest, one-class SVM, SVDD, autoencoder reconstruction-error, etc.)
+    # — the 0.78 AUC was a board-pooling eval leak; clean held-out AUC 0.50, 83%
+    # overkill. This bans only the label-free anomaly/OOD framing. It does NOT ban
+    # SUPERVISED anomaly-detection models trained with G/NG labels (e.g. PatchCore,
+    # EfficientAD): those learn from the labels and are a distinct mechanism, so they
+    # carry their own mechanism_class (e.g. "patchcore", "efficientad") and remain
+    # allowed for empirical evaluation.
+    ("model_architecture", "unsupervised_anomaly_detector"),
     # MG14: local-patch / multiple-instance-learning route — AUC 0.45, 98% overkill.
     ("model_architecture", "local_patch_mil"),
 }

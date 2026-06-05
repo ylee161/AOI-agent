@@ -9,6 +9,23 @@ from mle_star_agent.shared.labels import normalize_label
 
 logger = logging.getLogger(__name__)
 
+METRICS_LABEL = "METRICS"
+PROBE_METRICS_LABEL = "PROBE_METRICS"
+EPOCH_LOG_LABEL = "EPOCH_LOG"
+CALIBRATION_STATS_LABEL = "CALIBRATION_STATS"
+THRESHOLD_CURVE_LABEL = "THRESHOLD_CURVE"
+PREDICTIONS_LABEL = "PREDICTIONS"
+ERROR_ANALYSIS_LABEL = "ERROR_ANALYSIS"
+
+REQUIRED_GENERATED_SCRIPT_MARKERS = (
+    f"{PROBE_METRICS_LABEL}:",
+    f"{EPOCH_LOG_LABEL}:",
+    f"{METRICS_LABEL}:",
+    f"{CALIBRATION_STATS_LABEL}:",
+    f"{THRESHOLD_CURVE_LABEL}:",
+    f"{PREDICTIONS_LABEL}:",
+)
+
 
 @dataclass
 class AOIMetrics:
@@ -31,7 +48,7 @@ class AOIMetrics:
 
 def parse_metrics(stdout: str) -> Optional[AOIMetrics]:
     # Use the depth-tracking extractor so nested braces in the JSON don't cause truncation
-    raw = _extract_json_block(stdout, "METRICS")
+    raw = _extract_json_block(stdout, METRICS_LABEL)
     if not isinstance(raw, dict):
         return None
 
@@ -145,7 +162,7 @@ def _extract_json_block(stdout: str, label: str) -> Any:
 
 def parse_probe_metrics(stdout: str) -> Optional[dict]:
     """Parse PROBE_METRICS: {...} from generated script stdout."""
-    raw = _extract_json_block(stdout, "PROBE_METRICS")
+    raw = _extract_json_block(stdout, PROBE_METRICS_LABEL)
     if not isinstance(raw, dict):
         return None
 
@@ -163,7 +180,7 @@ def parse_probe_metrics(stdout: str) -> Optional[dict]:
 
     parsed = dict(raw)
     parsed.update({
-        "source": "PROBE_METRICS",
+        "source": PROBE_METRICS_LABEL,
         "g_prob_mean": g_prob_mean,
         "ng_prob_mean": ng_prob_mean,
         "probability_gap": probability_gap,
@@ -325,16 +342,16 @@ def _metrics_consistency(metrics: Optional[AOIMetrics], fp_count: int, fn_count:
 
 def parse_error_analysis(stdout: str, metrics: Optional[AOIMetrics] = None) -> dict:
     """Parse deterministic per-sample error evidence from generated script stdout."""
-    raw_error_analysis = _extract_json_block(stdout, "ERROR_ANALYSIS")
-    raw_predictions = _extract_json_block(stdout, "PREDICTIONS")
+    raw_error_analysis = _extract_json_block(stdout, ERROR_ANALYSIS_LABEL)
+    raw_predictions = _extract_json_block(stdout, PREDICTIONS_LABEL)
 
     source = None
     predictions_raw = None
     if isinstance(raw_predictions, list):
-        source = "PREDICTIONS"
+        source = PREDICTIONS_LABEL
         predictions_raw = raw_predictions
     elif isinstance(raw_error_analysis, dict):
-        source = "ERROR_ANALYSIS"
+        source = ERROR_ANALYSIS_LABEL
         predictions_raw = raw_error_analysis.get("predictions")
 
     if isinstance(predictions_raw, list):

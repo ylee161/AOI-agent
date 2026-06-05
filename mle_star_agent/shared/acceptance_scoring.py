@@ -9,7 +9,16 @@ def _metric(metrics: Any, name: str, default: float) -> float:
     if metrics is None:
         return default
     if isinstance(metrics, Mapping):
-        value = metrics.get(name, default)
+        cv_aliases = {
+            "accuracy": "mean_val_accuracy",
+            "ng_recall": "worst_fold_val_ng_recall",
+            "miss_rate": "worst_fold_val_miss_rate",
+            "overkill_rate": "mean_val_overkill",
+        }
+        if name in cv_aliases and cv_aliases[name] in metrics:
+            value = metrics.get(cv_aliases[name], default)
+        else:
+            value = metrics.get(name, default)
     else:
         value = getattr(metrics, name, default)
     try:
@@ -119,16 +128,18 @@ def is_acceptance_improvement(new_metrics: Any, current_metrics: Any) -> bool:
         return False
 
     # 3. Distances tie: lexicographic P0->P1->P2->P4 tie-breaker.
+    #    Order must follow the spec priority: miss_rate (P0), then ng_recall (P1),
+    #    then overkill_rate (P2), then accuracy (P4). f1 is a final tiebreaker.
     return (
         new["miss_rate"],
+        -new["ng_recall"],
         new["overkill_rate"],
         -new["accuracy"],
-        -new["ng_recall"],
         -new["f1"],
     ) < (
         current["miss_rate"],
+        -current["ng_recall"],
         current["overkill_rate"],
         -current["accuracy"],
-        -current["ng_recall"],
         -current["f1"],
     )

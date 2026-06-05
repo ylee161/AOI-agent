@@ -46,7 +46,7 @@ BOARD_CODE_PATTERN = r"VHB[A-Z0-9]+"
 # Trailing digits stripped off the matched code so different lot-sequence runs of
 # the same board share one group (SUP046: "VHB48301B0701" -> "VHB48301B07").
 # Set to 0 to disable stripping.
-BOARD_CODE_STRIP_SUFFIX_DIGITS = 2
+BOARD_CODE_STRIP_SUFFIX_DIGITS = 0
 
 # Models
 # num_retries is forwarded to litellm.acompletion (ADK's LiteLlm passes through
@@ -115,6 +115,13 @@ CURVE_ABORT_MIN_EPOCHS   = 3     # need >= this many per-epoch points to attempt
 CURVE_ABORT_DEBUG_EPOCHS = 4     # epoch cap for the debug micro-run (was 1) so it emits a curve
 CURVE_ABORT_MARGIN       = 0.05  # projected final must be worse than the best by at least this
 CURVE_ABORT_MIN_FIT      = 0.70  # min fit_quality (R^2 in [0,1]) required to trust the projection
+# Curve-abort also projects the per-epoch val_overkill trajectory. A full run is
+# pruned ONLY when the projected ng_recall is confidently worse than the best AND
+# the projected overkill is confidently worse than the best overkill (both must
+# fail — if either trajectory still projects healthy, threshold tuning can likely
+# rescue the run). Overkill uses a LOOSER margin than ng_recall because per-epoch
+# overkill is noisier on the 5%-data micro-run. Do NOT reuse CURVE_ABORT_MARGIN.
+CURVE_ABORT_OVERKILL_MARGIN = 0.10  # projected overkill must exceed the best by at least this
 
 PHASE1_SMOKE_TOP_K = 2  # full-run the top smoke-ranked initial candidates
 PHASE1_SMOKE_UNCERTAINTY_BAND = 0.05  # also full-run candidates within this score gap

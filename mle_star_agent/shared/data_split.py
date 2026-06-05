@@ -204,6 +204,68 @@ def _board_grouped_split(
     return train_ids, val_ids, test_ids
 
 
+def board_grouped_kfold(samples: list, k: int = 3, random_state: int = 42) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    Return board-grouped train/val folds from sample dictionaries.
+
+    Each board group appears in validation exactly once and never appears in
+    both train and validation for the same fold. Board keys reuse the same
+    configured extraction path as the fixed grouped split when a sample does not
+    already carry ``board_code``.
+    """
+    if k < 2:
+        raise ValueError("k must be at least 2")
+    if not samples:
+        raise ValueError("samples must not be empty")
+
+    normalized_samples = []
+    for sample in samples:
+        item = dict(sample)
+        if not item.get("board_code"):
+            lot_name = item.get("lot") or str(item.get("sample_id", "")).split("/", 1)[0]
+            item["board_code"] = _extract_board_code(str(lot_name))
+        normalized_samples.append(item)
+
+    board_to_samples: dict[str, list] = defaultdict(list)
+    for sample in normalized_samples:
+        board_to_samples[sample["board_code"]].append(sample)
+
+    if len(board_to_samples) < k:
+        raise ValueError(
+            f"Need at least {k} board groups for board-grouped CV; "
+            f"found {len(board_to_samples)}."
+        )
+
+    boards = sorted(
+        board_to_samples,
+        key=lambda board: (len(board_to_samples[board]), board),
+        reverse=True,
+    )
+    fold_boards = [[] for _ in range(k)]
+    fold_sizes = [0 for _ in range(k)]
+    for board in boards:
+        fold_index = min(range(k), key=lambda i: (fold_sizes[i], i))
+        fold_boards[fold_index].append(board)
+        fold_sizes[fold_index] += len(board_to_samples[board])
+
+    folds = []
+    for val_boards in fold_boards:
+        val_board_set = set(val_boards)
+        train_rows = [
+            sample
+            for sample in normalized_samples
+            if sample["board_code"] not in val_board_set
+        ]
+        val_rows = [
+            sample
+            for board in val_boards
+            for sample in board_to_samples[board]
+        ]
+        folds.append((pd.DataFrame(train_rows), pd.DataFrame(val_rows)))
+
+    return folds
+
+
 def detect_input_modality(dataset_folders: List[str]) -> str:
     """Auto-detect whether the dataset is stereo (paired _L_/_R_ PNGs) or mono.
 

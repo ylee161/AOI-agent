@@ -1,4 +1,5 @@
 import hashlib
+import re
 
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
@@ -13,6 +14,7 @@ from mle_star_agent.shared.difference_feature_validator import (
 from mle_star_agent.shared.lr_schedule_validator import (
     validate_lr_schedule_source,
 )
+from mle_star_agent.shared.metrics_parser import REQUIRED_GENERATED_SCRIPT_MARKERS
 from mle_star_agent.shared.small_data_strategy_validator import (
     validate_small_data_strategy_source,
 )
@@ -35,12 +37,11 @@ _DRY_RUN_ENV = {
 }
 
 _VALIDATOR_TIMEOUT = 120  # seconds — enough for 1 epoch on 10 samples, even on CPU
-_REQUIRED_FULL_RUN_MARKERS = (
-    "PROBE_METRICS:",
-    "CALIBRATION_STATS:",
-    "THRESHOLD_CURVE:",
-    "PREDICTIONS:",
+_REQUIRED_FULL_RUN_MARKERS = REQUIRED_GENERATED_SCRIPT_MARKERS
+_EPOCH_TERNARY_CONTRACT_RE = re.compile(
+    r"\bepochs\s*=\s*DRY_RUN_EPOCHS\s+if\s+DRY_RUN\s+else\b"
 )
+_SCHEDULER_STEP_CONTRACT_RE = re.compile(r"\bscheduler\.step\s*\(")
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,15 @@ def run_script_fn(script: str) -> dict:
     Dry-run env vars injected: DRY_RUN=1, DRY_RUN_EPOCHS=1, DRY_RUN_SAMPLES=10.
     Scripts must honour these to cap training to a few seconds.
     """
+    rejection_reasons = generated_script_contract_rejection_reasons(script)
+    if rejection_reasons:
+        return {
+            "returncode": 2,
+            "stdout": "",
+            "stderr": "CONTRACT_VALIDATION_FAILED: " + "; ".join(rejection_reasons),
+            "timed_out": False,
+            "duration_ms": 0.0,
+        }
     result = code_runner.run_script(script, timeout=_VALIDATOR_TIMEOUT, env=_DRY_RUN_ENV)
     return {
         "returncode": result.returncode,
@@ -65,14 +75,36 @@ def run_script_fn(script: str) -> dict:
 
 def missing_required_full_run_markers(script: str) -> list[str]:
     """Return full-run diagnostic markers missing from generated script text."""
-    return [marker for marker in _REQUIRED_FULL_RUN_MARKERS if marker not in script]
+    missing = []
+    for marker in _REQUIRED_FULL_RUN_MARKERS:
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(marker)}"
+        if re.search(pattern, script) is None:
+            missing.append(marker)
+    return missing
+
+
+def generated_script_contract_rejection_reasons(script: str) -> list[str]:
+    """Return deterministic generated-script contract rejection reasons."""
+    reasons = [
+        f"missing required marker {marker}"
+        for marker in missing_required_full_run_markers(script)
+    ]
+    if _EPOCH_TERNARY_CONTRACT_RE.search(script) is None:
+        reasons.append(
+            "missing epoch ternary: epochs = DRY_RUN_EPOCHS if DRY_RUN else"
+        )
+    if _SCHEDULER_STEP_CONTRACT_RE.search(script) is None:
+        reasons.append("missing scheduler.step() call")
+    return reasons
 
 
 def static_contract_check_fn(script: str) -> dict:
     missing = missing_required_full_run_markers(script)
+    rejection_reasons = generated_script_contract_rejection_reasons(script)
     return {
-        "ok": not missing,
+        "ok": not rejection_reasons,
         "missing_markers": missing,
+        "rejection_reasons": rejection_reasons,
     }
 
 
@@ -289,20 +321,34 @@ fails, rewrite the script before proceeding.
 
 First call `static_contract_check_fn` with the script.
 
-Read the (possibly rewritten) script and verify it contains full-run diagnostic
-output for all required markers:
+This deterministic helper is a HARD gate. If its `ok` field is False, rewrite
+the script before execution using the clear strings in `rejection_reasons` as the
+targeted retry instructions.
+
+Read the (possibly rewritten) script and verify it contains the generated-script
+plumbing required by the evaluator, smoke triage, metrics parser, and debug
+epoch rewriter:
 
   PROBE_METRICS: {{"ng_recall": ..., "overkill_rate": ..., "G_prob_mean": ..., "NG_prob_mean": ..., "should_continue": true/false}}
+  EPOCH_LOG: {{"epoch": ..., "train_loss": ..., "val_loss": ..., "val_ng_recall": ..., "val_overkill": ...}}
+  METRICS: {{"accuracy": ..., "ng_recall": ..., "miss_rate": ..., "overkill_rate": ..., "f1": ..., "threshold": ..., "tp": ..., "tn": ..., "fp": ..., "fn": ...}}
   CALIBRATION_STATS: {{"G_prob_mean": ..., "G_prob_std": ..., "NG_prob_mean": ..., "NG_prob_std": ...}}
   THRESHOLD_CURVE: [...]
   PREDICTIONS: [...]
 
-If any marker is missing, rewrite the script before proceeding. `PROBE_METRICS`
-is mandatory because the evaluator uses it to reject clearly bad candidates
-before a full training run; the script should print it after a cheap probe and
-exit early when `should_continue` is false. `CALIBRATION_STATS`
-is mandatory because the deterministic diagnosis scorer needs G/NG probability
-means to classify high-overkill failures reliably.
+It must also contain the exact dry-run epoch ternary shape consumed by the debug
+epoch rewrite contract:
+
+  epochs = DRY_RUN_EPOCHS if DRY_RUN else ...
+
+Finally, it must call `scheduler.step(...)` somewhere in executable training code.
+
+If any marker or structural plumbing item is missing, rewrite the script before
+proceeding. `PROBE_METRICS` is mandatory because the evaluator uses it to reject
+clearly bad candidates before a full training run; the script should print it
+after a cheap probe and exit early when `should_continue` is false.
+`CALIBRATION_STATS` is mandatory because the deterministic diagnosis scorer needs
+G/NG probability means to classify high-overkill failures reliably.
 
 ---
 ## CHECK 2C2 — Degenerate Threshold Guard (Static Analysis, no execution)

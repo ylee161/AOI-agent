@@ -242,46 +242,38 @@ Each sample dict has: `sample_id` (str), the image path(s) for this dataset's in
    pos_weight = torch.tensor([OVERKILL_BUDGET / MISS_BUDGET])  # ≈ 2.67 for default config
    ```
    This encodes "I can afford to false-alarm on OVERKILL_BUDGET/MISS_BUDGET × as many good samples as I can afford to miss defects." It is self-adjusting: if config tightens MISS_BUDGET on a new dataset, pos_weight increases automatically. Pass to `BCEWithLogitsLoss(pos_weight=pos_weight.to(device))`; for `CrossEntropyLoss` (multi-class path) set `weight=torch.tensor([1.0, float(pos_weight)]).to(device)` (the weight tensor MUST be moved to `device` or CUDA logits will raise a device-mismatch error).
-4. **Threshold sweep**: after training, sweep threshold from 0.01 to 0.99 inclusive with step 0.01 on the VAL set. Use acceptance-distance selection — never pick a threshold that minimises miss_rate while ignoring overkill:
+4. **Threshold sweep**: after training, sweep threshold from 0.01 to 0.99 inclusive with step 0.01 on the VAL set. Select the operating point with the strict **Stage 0 → 1 → 2** priority below — miss_rate protection (P0) is always resolved before overkill reduction (P2). Do NOT use acceptance-distance averaging or any blended score as the primary objective; the Phase 2 validator (CHECK 2B) hard-rejects that contract:
 
    ```python
-   MISS_BUDGET    = {config.MISS_RATE_RELAXED_MAX}
-   RECALL_MIN     = {config.NG_RECALL_RELAXED_MIN}
+   MISS_BUDGET     = {config.MISS_RATE_RELAXED_MAX}
    OVERKILL_BUDGET = {config.OVERKILL_RELAXED_MAX}
-   ACC_MIN        = {config.ACCURACY_RELAXED_MIN}
+   FP_MAX          = 2   # FP <= 2 is mandatory at the current 30-G val/test scale
 
-   best_passing_candidate  = None   # set when any threshold satisfies all four constraints
-   best_distance_candidate = None   # acceptance-distance of the best fallback so far
-   best_fallback_threshold = 0.5
-   best_threshold          = 0.5
-
+   # Collect every threshold's metrics first, then apply the staged selection.
+   all_candidates = []   # each: (threshold, miss_rate, overkill_rate, fp)
    for threshold in [round(i / 100.0, 2) for i in range(1, 100)]:
-       # ... compute tp/tn/fp/fn, then:
-       miss_gap     = max(0.0, current_miss_rate     - MISS_BUDGET)     / max(MISS_BUDGET, 1e-9)
-       recall_gap   = max(0.0, RECALL_MIN            - current_recall)   / max(RECALL_MIN, 1e-9)
-       overkill_gap = max(0.0, current_overkill_rate - OVERKILL_BUDGET)  / max(OVERKILL_BUDGET, 1e-9)
-       accuracy_gap = max(0.0, ACC_MIN               - current_accuracy) / max(ACC_MIN, 1e-9)
-       current_distance = miss_gap + recall_gap + overkill_gap + accuracy_gap
+       # ... compute tp/tn/fp/fn, current_miss_rate, current_overkill_rate ...
+       all_candidates.append((threshold, current_miss_rate, current_overkill_rate, current_fp))
 
-       passes = (current_miss_rate <= MISS_BUDGET and current_recall >= RECALL_MIN
-                 and current_overkill_rate <= OVERKILL_BUDGET and current_accuracy >= ACC_MIN)
-       if passes:
-           candidate = (current_miss_rate, current_overkill_rate, -current_accuracy, -current_recall, threshold)
-           if best_passing_candidate is None or candidate < best_passing_candidate:
-               best_passing_candidate = candidate
-               best_threshold = threshold
-       else:
-           if best_distance_candidate is None or current_distance < best_distance_candidate:
-               best_distance_candidate = current_distance
-               best_fallback_threshold = threshold
-
-   if best_passing_candidate is None:
-       best_threshold = best_fallback_threshold   # balanced tradeoff, NOT min-miss-rate
+   # Stage 0 — filter out thresholds with FP > 2 (FP <= 2 is mandatory).
+   survivors = [c for c in all_candidates if c[3] <= FP_MAX]
+   if survivors:
+       # Stage 1 — minimise miss_rate among the FP<=2 survivors (target <= MISS_BUDGET).
+       min_miss = min(c[1] for c in survivors)
+       stage1   = [c for c in survivors if c[1] == min_miss]
+       # Stage 2 — among ALL thresholds achieving that minimum miss_rate, pick the
+       # one with the lowest overkill_rate (target <= OVERKILL_BUDGET).
+       best_threshold = min(stage1, key=lambda c: c[2])[0]
+   else:
+       # No threshold survives FP <= 2: choose the minimum FP count, then lowest
+       # miss_rate, and report the result as below-target. NEVER silently accept a
+       # min-miss-rate-only point with catastrophic overkill.
+       best_threshold = min(all_candidates, key=lambda c: (c[3], c[1]))[0]
    ```
 
-   **Do NOT** filter out thresholds with `FP <= 2` as a hard gate — it silently falls back to a min-miss-rate policy when no threshold survives, which produces catastrophic overkill. The acceptance-distance fallback above handles the no-passing-threshold case with a balanced tradeoff.
+   **Do NOT** rank thresholds by an acceptance-distance / blended-gap score: miss_rate (P0) must be fully resolved before overkill (P2), and the FP <= 2 Stage 0 gate above is mandatory — its no-survivor branch (min FP → min miss_rate, reported below-target) is the contract-correct fallback, not a balanced average.
 
-   **Probability calibration before the sweep**: after training, fit `sklearn.isotonic.IsotonicRegression(out_of_bounds="clip")` on the VALIDATION scores (`X = raw_val_ng_scores`, `y = val_true_binary` with 1=NG, 0=G), then map all val/test scores through the fitted calibrator (`cal_probs = iso.transform(raw_scores)`) so every probability is on the calibrated [0,1] scale. Run the acceptance-distance sweep above on these CALIBRATED probabilities (the sweep already steps 0.01, finer than 0.05). The THRESHOLD_CURVE, the final test metrics, and the reported `threshold` MUST all be computed on the calibrated probabilities — never the raw scores. Labels are binary G/NG only (no defect sub-classes), so this is a single global calibrator and a single global threshold.
+   **Probability calibration before the sweep**: after training, fit `sklearn.isotonic.IsotonicRegression(out_of_bounds="clip")` on the VALIDATION scores (`X = raw_val_ng_scores`, `y = val_true_binary` with 1=NG, 0=G), then map all val/test scores through the fitted calibrator (`cal_probs = iso.transform(raw_scores)`) so every probability is on the calibrated [0,1] scale. Run the Stage 0/1/2 sweep above on these CALIBRATED probabilities (the sweep already steps 0.01, finer than 0.05). The THRESHOLD_CURVE, the final test metrics, and the reported `threshold` MUST all be computed on the calibrated probabilities — never the raw scores. Labels are binary G/NG only (no defect sub-classes), so this is a single global calibrator and a single global threshold.
 5. **METRICS output**: the last thing the script prints to stdout must be exactly:
    ```
    METRICS: {{"accuracy": ..., "ng_recall": ..., "miss_rate": ..., "overkill_rate": ..., "f1": ..., "avg_latency_ms": ..., "threshold": ..., "ng_count": ..., "g_count": ..., "tp": ..., "tn": ..., "fp": ..., "fn": ..., "roc_auc": ..., "prob_gap": ...}}

@@ -1,5 +1,8 @@
 import hashlib
+import json
 import logging
+import tempfile
+from pathlib import Path
 
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
@@ -33,6 +36,7 @@ from mle_star_agent.shared.selection_metrics import (
     build_selection_evaluation,
 )
 from mle_star_agent.shared.aoi_smoke_triage import build_smoke_diagnostics
+from mle_star_agent.shared.data_split import board_grouped_kfold
 from mle_star_agent.shared.metrics_parser import (
     AOIMetrics,
     metrics_to_dict,
@@ -61,9 +65,41 @@ _TARGET_COMPONENT_ALIASES = {
     "training_schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
 }
 
+# Persistent AOI KB (cross-run "Experience-Driven Global Memory") bounds.
+# The KB is append-ordered; without a cap it grows unbounded across runs and the
+# planner's TAG_ROLLUP gets dominated by stale dead-ends. Keep the most recent
+# PERSISTENT_KB_MAX_RECORDS via FIFO, and skip appending a record whose
+# (tags, target_component, mechanism_class) signature matches any of the last
+# PERSISTENT_KB_DEDUP_RECENT_WINDOW records so repeated identical attempts don't
+# flood the memory.
+PERSISTENT_KB_MAX_RECORDS = 200
+PERSISTENT_KB_DEDUP_RECENT_WINDOW = 25
+
+
+def _kb_dedup_signature(record: dict) -> tuple:
+    """Order-insensitive (tags, target_component, mechanism_class) signature.
+
+    Legacy records lack the fingerprint fields, so they resolve to (tags, None,
+    None) and only collide with another fingerprint-less record — never with a
+    new fingerprinted one. Never raises on malformed input.
+    """
+    if not isinstance(record, dict):
+        return ((), None, None)
+    tags = record.get("tags") or []
+    tags_key = tuple(sorted(str(t) for t in tags if t)) if isinstance(tags, list) else ()
+    return (tags_key, record.get("target_component"), record.get("mechanism_class"))
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _state_pop(state, key, default=None):
+    """ADK State doesn't support .pop() or del — null the key out instead."""
+    val = state.get(key, default)
+    if key in state:
+        state[key] = None
+    return val
+
 
 def _normalise_target_component(target_component: str) -> str:
     target = (target_component or "unknown").strip().lower()
@@ -107,10 +143,11 @@ def _save_best_pipeline(state: dict) -> None:
     })
 
 
-def _clear_ablation_state(state: dict) -> None:
-    for key in list(state.keys()):
+def _clear_ablation_state(state) -> None:
+    keys = list(state.to_dict().keys()) if hasattr(state, "to_dict") else list(state.keys())
+    for key in keys:
         if key == "ablation_results" or key.startswith("ablation_result_") or key.startswith("ablation_script_"):
-            state.pop(key, None)
+            _state_pop(state, key)
 
 
 def _is_improvement(
@@ -322,6 +359,206 @@ def _run_multiseed_confirmation(script: str) -> tuple[AOIMetrics | None, list[di
     return _metrics_from_dict(average_metrics_dicts(successful)), seed_results
 
 
+def _aggregate_cv_fold_metrics(fold_metrics: list[dict]) -> dict:
+    """Aggregate per-fold validation metrics into conservative decision metrics."""
+    if not fold_metrics:
+        return {}
+
+    def values(key: str) -> list[float]:
+        return [float(metrics.get(key, 0.0) or 0.0) for metrics in fold_metrics]
+
+    ng_recall = values("ng_recall")
+    overkill = values("overkill_rate")
+    accuracy = values("accuracy")
+    miss_rate = values("miss_rate")
+    f1 = values("f1")
+
+    aggregated = {
+        "cv_fold_count": len(fold_metrics),
+        "mean_val_ng_recall": sum(ng_recall) / len(ng_recall),
+        "worst_fold_val_ng_recall": min(ng_recall),
+        "mean_val_overkill": sum(overkill) / len(overkill),
+        "worst_fold_val_overkill": max(overkill),
+        "mean_val_accuracy": sum(accuracy) / len(accuracy),
+        "worst_fold_val_accuracy": min(accuracy),
+        "mean_val_miss_rate": sum(miss_rate) / len(miss_rate),
+        "worst_fold_val_miss_rate": max(miss_rate),
+    }
+    if f1:
+        aggregated["mean_val_f1"] = sum(f1) / len(f1)
+        aggregated["worst_fold_val_f1"] = min(f1)
+
+    # Compatibility aliases consumed by existing AOIMetrics/state code. The
+    # acceptance layer maps CV dicts the same way for direct dict comparisons.
+    aggregated.update({
+        "ng_recall": aggregated["worst_fold_val_ng_recall"],
+        "overkill_rate": aggregated["mean_val_overkill"],
+        "accuracy": aggregated["mean_val_accuracy"],
+        "miss_rate": aggregated["worst_fold_val_miss_rate"],
+        "f1": aggregated.get("mean_val_f1", 0.0),
+    })
+    return aggregated
+
+
+def _script_with_data_split_path(script: str, split_path: Path) -> str:
+    path_text = str(split_path)
+    patched = script
+    for old in {
+        str(config.CKPT_DATA_SPLIT),
+        "checkpoints/data_split_grouped.json",
+        "checkpoints/data_split.json",
+    }:
+        patched = patched.replace(old, path_text)
+    return patched
+
+
+def _fold_split_payload(base_split: dict, train_df, val_df, fold_index: int, test_rows: list[dict] | None = None) -> dict:
+    train_rows = train_df.to_dict("records")
+    val_rows = val_df.to_dict("records")
+    test_rows = list(test_rows or [])
+    all_rows = train_rows + val_rows + test_rows
+    labels = [row.get("label") for row in all_rows]
+    stats = dict(base_split.get("stats", {}) or {})
+    stats.update({
+        "cv_fold": fold_index,
+        "total": len(all_rows),
+        "ng_count": labels.count("NG"),
+        "g_count": labels.count("G"),
+        "train_size": len(train_rows),
+        "val_size": len(val_rows),
+        "test_size": len(test_rows),
+        "board_groups": sorted({row.get("board_code") for row in all_rows if row.get("board_code")}),
+        "val_board_groups": sorted({row.get("board_code") for row in val_rows if row.get("board_code")}),
+    })
+    metadata = dict(base_split.get("metadata", {}) or {})
+    metadata.update({"cv_fold": fold_index, "cv_mode": "board_grouped_kfold"})
+    return {
+        "metadata": metadata,
+        "train": train_rows,
+        "val": val_rows,
+        "test": test_rows,
+        "stats": stats,
+    }
+
+
+def _run_board_grouped_cv_confirmation(script: str, k: int = 3) -> tuple[dict | None, list[dict]]:
+    """Run one promising candidate over board-grouped validation folds."""
+    base_split = load_checkpoint(config.CKPT_DATA_SPLIT)
+    cv_samples = (
+        list(base_split.get("train", []) or [])
+        + list(base_split.get("val", []) or [])
+        + list(base_split.get("test", []) or [])
+    )
+    folds = board_grouped_kfold(cv_samples, k=k)
+    fold_results = []
+
+    for fold_index, (train_df, val_df) in enumerate(folds, start=1):
+        fold_payload = _fold_split_payload(base_split, train_df, val_df, fold_index, test_rows=[])
+        with tempfile.NamedTemporaryFile(
+            suffix=f"_aoi_cv_fold_{fold_index}.json",
+            mode="w",
+            delete=False,
+        ) as handle:
+            json.dump(fold_payload, handle)
+            fold_path = Path(handle.name)
+
+        try:
+            result = code_runner.run_script(
+                _script_with_data_split_path(script, fold_path),
+                timeout=config.TIMEOUT_SECONDS,
+                env={"AOI_RANDOM_SEED": "42", "PYTHONHASHSEED": "42", "SEED": "42"},
+            )
+        finally:
+            fold_path.unlink(missing_ok=True)
+
+        metrics = parse_metrics(result.stdout)
+        metrics = metric_guard.guard_metrics(
+            metrics, result.duration_ms, context=f"phase2 board-cv fold={fold_index}"
+        )
+        metrics_dict = metrics_to_dict(metrics) if metrics else None
+        fold_results.append({
+            "fold": fold_index,
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "duration_ms": round(result.duration_ms, 1),
+            "val_board_groups": fold_payload["stats"]["val_board_groups"],
+            "train_size": fold_payload["stats"]["train_size"],
+            "val_size": fold_payload["stats"]["val_size"],
+            "metrics": metrics_dict,
+            "stderr_tail": result.stderr[-1000:],
+        })
+        if metrics_dict:
+            logger.info(
+                "Board CV fold %d/%d: ng_recall=%.4f miss_rate=%.4f "
+                "overkill=%.4f accuracy=%.4f val_boards=%s",
+                fold_index, k,
+                float(metrics_dict.get("ng_recall", 0.0) or 0.0),
+                float(metrics_dict.get("miss_rate", 1.0) or 1.0),
+                float(metrics_dict.get("overkill_rate", 1.0) or 1.0),
+                float(metrics_dict.get("accuracy", 0.0) or 0.0),
+                fold_payload["stats"]["val_board_groups"],
+            )
+        else:
+            logger.warning(
+                "Board CV fold %d/%d failed: rc=%s timed_out=%s stderr=%s",
+                fold_index, k, result.returncode, result.timed_out,
+                result.stderr[-300:],
+            )
+
+    successful = [r["metrics"] for r in fold_results if r.get("metrics") is not None]
+    if len(successful) != k:
+        return None, fold_results
+    return _aggregate_cv_fold_metrics(successful), fold_results
+
+
+def _format_cv_evaluation(selection_evaluation: dict | None) -> str:
+    def metric_value(metrics: dict, key: str, default: float) -> float:
+        value = metrics.get(key, default)
+        if value is None:
+            return default
+        return float(value)
+
+    if not isinstance(selection_evaluation, dict):
+        return ""
+    if selection_evaluation.get("mode") != "board_grouped_cv":
+        return ""
+    lines = ["BOARD_GROUPED_CV:"]
+    for fold in selection_evaluation.get("per_fold", []) or []:
+        metrics = fold.get("metrics") or {}
+        if metrics:
+            lines.append(
+                "  fold {fold}: ng_recall={ng:.3f} miss_rate={miss:.3f} "
+                "overkill={over:.3f} accuracy={acc:.3f} val_boards={boards}".format(
+                    fold=fold.get("fold"),
+                    ng=metric_value(metrics, "ng_recall", 0.0),
+                    miss=metric_value(metrics, "miss_rate", 1.0),
+                    over=metric_value(metrics, "overkill_rate", 1.0),
+                    acc=metric_value(metrics, "accuracy", 0.0),
+                    boards=fold.get("val_board_groups", []),
+                )
+            )
+        else:
+            lines.append(
+                "  fold {fold}: FAILED rc={rc} timed_out={timed_out}".format(
+                    fold=fold.get("fold"),
+                    rc=fold.get("returncode"),
+                    timed_out=fold.get("timed_out"),
+                )
+            )
+    metrics = selection_evaluation.get("metrics") or {}
+    if metrics:
+        lines.append(
+            "  aggregate: worst_ng_recall={ng:.3f} worst_miss_rate={miss:.3f} "
+            "mean_overkill={over:.3f} mean_accuracy={acc:.3f}".format(
+                ng=metric_value(metrics, "worst_fold_val_ng_recall", 0.0),
+                miss=metric_value(metrics, "worst_fold_val_miss_rate", 1.0),
+                over=metric_value(metrics, "mean_val_overkill", 1.0),
+                acc=metric_value(metrics, "mean_val_accuracy", 0.0),
+            )
+        )
+    return "\n".join(lines)
+
+
 def _confirm_improvement_with_selection_average(
     *,
     script: str,
@@ -334,19 +571,172 @@ def _confirm_improvement_with_selection_average(
     if not _requires_multiseed_confirmation(metrics_dict, initially_improved):
         return initially_improved, metrics_dict, None
 
-    run_average = run_average or _run_multiseed_confirmation
-    averaged_metrics, seed_results = run_average(script)
-    selection_evaluation = build_selection_evaluation(
-        seeds=config.MULTISEED_CONFIRMATION_SEEDS,
-        seed_results=seed_results,
-        averaged_metrics=_normalise_metrics_dict(averaged_metrics) if averaged_metrics is not None else None,
-    )
+    if run_average is not None:
+        averaged_metrics, seed_results = run_average(script)
+        selection_evaluation = build_selection_evaluation(
+            seeds=config.MULTISEED_CONFIRMATION_SEEDS,
+            seed_results=seed_results,
+            averaged_metrics=_normalise_metrics_dict(averaged_metrics) if averaged_metrics is not None else None,
+        )
+    else:
+        try:
+            averaged_metrics, fold_results = _run_board_grouped_cv_confirmation(script, k=3)
+            cv_failure_reason = "one_or_more_cv_folds_failed"
+        except ValueError as exc:
+            averaged_metrics = None
+            fold_results = []
+            cv_failure_reason = str(exc)
+        selection_evaluation = {
+            "status": "success" if averaged_metrics is not None else "incomplete",
+            "mode": "board_grouped_cv",
+            "fold_count": 3,
+            "metrics": dict(averaged_metrics) if averaged_metrics is not None else None,
+            "per_fold": fold_results,
+            "successful_fold_count": sum(1 for r in fold_results if r.get("metrics") is not None),
+            "expected_fold_count": 3,
+        }
+        if averaged_metrics is None:
+            selection_evaluation["failure_reason"] = cv_failure_reason
     if selection_evaluation.get("status") != "success":
         return False, metrics_dict, selection_evaluation
 
     selected_metrics = dict(selection_evaluation["metrics"])
     improved = is_acceptance_improvement(selected_metrics, current_metrics)
     return improved, selected_metrics, selection_evaluation
+
+
+# ---------------------------------------------------------------------------
+# Pareto archive maintenance for the refinement population
+#
+# The four refinement objectives are:
+#   miss_rate     (lower better)
+#   overkill_rate (lower better)
+#   ng_recall     (higher better)
+#   accuracy      (higher better)
+#
+# We keep a true Pareto archive instead of a scalar-sorted top-N: a candidate is
+# only discarded when it is dominated by an existing member, and members are only
+# dropped when the new candidate dominates them. When the archive overflows
+# REFINEMENT_POPULATION_MAX we evict the member contributing the least
+# hypervolume (the most redundant point on the front).
+# ---------------------------------------------------------------------------
+
+# Reference (nadir) point in the all-minimisation objective space:
+#   (miss_rate, overkill_rate, -ng_recall, -accuracy).
+# Every real metric vector is component-wise <= this worst-case point, so each
+# member's hypervolume box is non-negative.
+_PARETO_REFERENCE = (1.0, 1.0, 0.0, 0.0)
+
+
+def _safe_float(value, default: float) -> float:
+    """Coerce ``value`` to float, treating only ``None`` (not a legitimate 0.0)
+    as missing. Using ``x or default`` here would corrupt a real best-case 0.0
+    miss/overkill into the worst-case default."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _pareto_objective_vector(metrics: dict) -> tuple[float, float, float, float]:
+    """Map metrics to an all-minimisation objective vector (lower is better)."""
+    return (
+        _safe_float(metrics.get("miss_rate"), 1.0),
+        _safe_float(metrics.get("overkill_rate"), 1.0),
+        -_safe_float(metrics.get("ng_recall"), 0.0),
+        -_safe_float(metrics.get("accuracy"), 0.0),
+    )
+
+
+def _dominates(a: tuple, b: tuple) -> bool:
+    """True if vector ``a`` Pareto-dominates ``b`` (all-minimisation): no worse in
+    every objective and strictly better in at least one."""
+    no_worse = all(ai <= bi for ai, bi in zip(a, b))
+    strictly_better = any(ai < bi for ai, bi in zip(a, b))
+    return no_worse and strictly_better
+
+
+def _hypervolume(vectors: list[tuple]) -> float:
+    """Exact hypervolume of the union of boxes [v, reference] via inclusion-exclusion.
+
+    Each point ``v`` (all-minimisation) dominates the axis-aligned box bounded
+    above by ``_PARETO_REFERENCE``. The dominated volume is the union of those
+    boxes. Inclusion-exclusion over subsets is exact and cheap for the small
+    archive sizes here (<= REFINEMENT_POPULATION_MAX + 1 points).
+    """
+    n = len(vectors)
+    if n == 0:
+        return 0.0
+    total = 0.0
+    for mask in range(1, 1 << n):
+        # Intersection of the selected boxes: per axis the lower bound is the
+        # worst (max) coordinate over the subset; volume is product of
+        # (reference - lower_bound), clamped at 0.
+        lower = [-float("inf")] * len(_PARETO_REFERENCE)
+        bits = 0
+        for i in range(n):
+            if mask & (1 << i):
+                bits += 1
+                for axis, val in enumerate(vectors[i]):
+                    if val > lower[axis]:
+                        lower[axis] = val
+        vol = 1.0
+        for axis, ref in enumerate(_PARETO_REFERENCE):
+            edge = ref - lower[axis]
+            if edge <= 0.0:
+                vol = 0.0
+                break
+            vol *= edge
+        total += vol if (bits % 2 == 1) else -vol
+    return total
+
+
+def _least_hypervolume_contributor(population: list[dict]) -> int:
+    """Index of the member whose removal shrinks the front's hypervolume least.
+
+    Ties (e.g. fully degenerate vectors) fall back to the largest crowding
+    distance — the most-isolated member is the safest to drop only when no
+    member contributes measurable volume."""
+    vectors = [_pareto_objective_vector(p.get("metrics", {})) for p in population]
+    total_hv = _hypervolume(vectors)
+    contributions = []
+    for i in range(len(vectors)):
+        without = vectors[:i] + vectors[i + 1:]
+        contributions.append(total_hv - _hypervolume(without))
+    min_contrib = min(contributions)
+    candidates = [i for i, c in enumerate(contributions) if c <= min_contrib + 1e-12]
+    if len(candidates) == 1:
+        return candidates[0]
+    # Fallback tiebreaker: crowding distance over the tied members. Evict the one
+    # with the LARGEST crowding distance (most isolated -> least informative to a
+    # diversity-seeking selector once volume is uninformative).
+    crowd = _crowding_distances(vectors)
+    return max(candidates, key=lambda i: crowd[i])
+
+
+def _crowding_distances(vectors: list[tuple]) -> list[float]:
+    """NSGA-II crowding distance per point (boundary points get +inf)."""
+    n = len(vectors)
+    distances = [0.0] * n
+    if n <= 2:
+        return [float("inf")] * n
+    num_obj = len(vectors[0])
+    for axis in range(num_obj):
+        order = sorted(range(n), key=lambda i: vectors[i][axis])
+        lo = vectors[order[0]][axis]
+        hi = vectors[order[-1]][axis]
+        span = hi - lo
+        distances[order[0]] = float("inf")
+        distances[order[-1]] = float("inf")
+        if span <= 0:
+            continue
+        for k in range(1, n - 1):
+            prev_v = vectors[order[k - 1]][axis]
+            next_v = vectors[order[k + 1]][axis]
+            distances[order[k]] += (next_v - prev_v) / span
+    return distances
 
 
 def _update_refinement_population(
@@ -358,7 +748,18 @@ def _update_refinement_population(
     outer_iteration: int,
     inner_iteration: int,
 ) -> None:
-    """Keep a small archive of useful candidates so refinement is not a single chain."""
+    """Maintain a true Pareto archive of useful candidates so refinement is not a
+    single chain.
+
+    The candidate is first gated on eligibility (an accepted improvement, or a
+    lower-overkill divergent branch). It is then merged into the archive by
+    Pareto non-dominance:
+      (a) add the new candidate,
+      (b) drop existing members it dominates,
+      (c) discard it if any existing member dominates it,
+      (d) if the archive overflows REFINEMENT_POPULATION_MAX, evict the member
+          with the lowest hypervolume contribution.
+    """
     metrics_dict = _normalise_metrics_dict(metrics)
     if not metrics_dict:
         return
@@ -380,18 +781,33 @@ def _update_refinement_population(
         "metrics": metrics_dict,
         "archive_reason": archive_reason,
     }
+    # Drop any prior copy of the same script before re-inserting.
     population = [
         p for p in list(state.get("refinement_population", []) or [])
         if p.get("script_sha256") != script_hash
     ]
+    new_vec = _pareto_objective_vector(metrics_dict)
+
+    # (c) If an existing member dominates the newcomer, it adds nothing — discard.
+    for member in population:
+        if _dominates(_pareto_objective_vector(member.get("metrics", {})), new_vec):
+            state["refinement_population"] = population
+            return
+
+    # (b) Remove every existing member the newcomer dominates.
+    population = [
+        member for member in population
+        if not _dominates(new_vec, _pareto_objective_vector(member.get("metrics", {})))
+    ]
+    # (a) Add the new candidate.
     population.append(entry)
-    population.sort(key=lambda p: (
-        float(p.get("metrics", {}).get("overkill_rate", 1.0) or 1.0),
-        float(p.get("metrics", {}).get("miss_rate", 1.0) or 1.0),
-        -float(p.get("metrics", {}).get("accuracy", 0.0) or 0.0),
-        -float(p.get("metrics", {}).get("ng_recall", 0.0) or 0.0),
-    ))
-    state["refinement_population"] = population[:config.REFINEMENT_POPULATION_MAX]
+
+    # (d) Evict the least-contributing member while the archive overflows.
+    while len(population) > config.REFINEMENT_POPULATION_MAX:
+        evict = _least_hypervolume_contributor(population)
+        population.pop(evict)
+
+    state["refinement_population"] = population
 
 
 # ---------------------------------------------------------------------------
@@ -554,16 +970,21 @@ def evaluate_and_update_fn(tool_context) -> str:
             f"inner_iteration now {m_next}, no_improve_count now {no_improve}."
         )
 
-    # ---- curve-abort: extrapolate the SHORT debug learning-curve and prune the
-    # full run ONLY when its projected final is CONFIDENTLY worse than the current
-    # best. The debug micro-run now emits config.CURVE_ABORT_DEBUG_EPOCHS epochs on
-    # 5% data (same 120s cap), so we have a per-epoch val_ng_recall curve. We fit a
-    # saturating power-law and prune only when the projection is trustworthy
-    # (fit_quality >= CURVE_ABORT_MIN_FIT) AND clearly below the best NG recall seen
-    # so far (by CURVE_ABORT_MARGIN). Safe-by-default: too few / poor-fit points, or
-    # no established baseline (best NG recall ~0 before any successful full run),
-    # never prune — borderline and early candidates fall through to the full run.
-    # A 5%-data short curve under-shoots the full-data plateau, hence the margin.
+    # ---- curve-abort: extrapolate the SHORT debug learning-curves and prune the
+    # full run ONLY when BOTH projected finals are CONFIDENTLY worse than the
+    # current best. The debug micro-run now emits config.CURVE_ABORT_DEBUG_EPOCHS
+    # epochs on 5% data (same 120s cap), so we have per-epoch val_ng_recall AND
+    # val_overkill curves. We fit a saturating power-law to each and prune only
+    # when the projection is trustworthy (fit_quality >= CURVE_ABORT_MIN_FIT) and
+    # confidently worse than the best seen so far: ng_recall below best by
+    # CURVE_ABORT_MARGIN, AND overkill above best by CURVE_ABORT_OVERKILL_MARGIN
+    # (looser, since overkill is noisier on 5%-data micro-runs). AND logic: a run
+    # is only hopeless when BOTH trajectories project bad — if EITHER still
+    # projects healthy, threshold tuning may rescue it (overkill is especially
+    # threshold-fixable), so it falls through to the full run. Safe-by-default:
+    # too few / poor-fit points, or no established baseline (best NG recall ~0 /
+    # best overkill ~1.0 before any successful full run), never prune.
+    # A 5%-data short curve under-shoots the full-data plateau, hence the margins.
     epoch_curve = (smoke_record.get("diagnostics") or {}).get("epoch_logs") or []
     ng_recall_series = [
         e.get("val_ng_recall")
@@ -572,16 +993,39 @@ def evaluate_and_update_fn(tool_context) -> str:
     ]
     projected_ng_recall, curve_fit = project_power_law(ng_recall_series)
     best_ng_recall = max(0.0, 1.0 - current_best_miss)
-    if (
+    ng_recall_curve_bad = (
         projected_ng_recall is not None
         and curve_fit >= config.CURVE_ABORT_MIN_FIT
         and projected_ng_recall < best_ng_recall - config.CURVE_ABORT_MARGIN
-    ):
+    )
+
+    # Overkill is a rate where LOWER is better, so a doomed trajectory projects a
+    # final overkill HIGHER than the best so far. Mirror the ng_recall projection
+    # with its own (looser) margin. Safe-by-default mirrors ng_recall: too few
+    # points, a poor fit, or no baseline (best_overkill_rate ~1.0, which the
+    # clamped-to-[0,1] projection can never exceed by the margin) -> not bad.
+    overkill_series = [
+        e.get("val_overkill")
+        for e in epoch_curve
+        if isinstance(e, dict) and e.get("val_overkill") is not None
+    ]
+    projected_overkill, overkill_fit = project_power_law(overkill_series)
+    overkill_curve_bad = (
+        projected_overkill is not None
+        and overkill_fit >= config.CURVE_ABORT_MIN_FIT
+        and projected_overkill > current_best_overkill + config.CURVE_ABORT_OVERKILL_MARGIN
+    )
+
+    if ng_recall_curve_bad and overkill_curve_bad:
         logger.warning(
             "Curve abort pruned (outer=%d, inner=%d): projected ng_recall=%.3f "
-            "(fit=%.2f) below best ng_recall=%.3f by > margin %.2f — skipping full run",
+            "(fit=%.2f) below best ng_recall=%.3f by > margin %.2f AND projected "
+            "overkill=%.3f (fit=%.2f) above best overkill=%.3f by > margin %.2f "
+            "— skipping full run",
             n, m, projected_ng_recall, curve_fit, best_ng_recall,
             config.CURVE_ABORT_MARGIN,
+            projected_overkill, overkill_fit, current_best_overkill,
+            config.CURVE_ABORT_OVERKILL_MARGIN,
         )
         m_next = m + 1
         tool_context.state["inner_iteration"] = m_next
@@ -608,6 +1052,8 @@ def evaluate_and_update_fn(tool_context) -> str:
             "smoke_diagnostics": smoke_record["diagnostics"],
             "projected_ng_recall": round(float(projected_ng_recall), 4),
             "curve_fit_quality":   round(float(curve_fit), 4),
+            "projected_overkill":  round(float(projected_overkill), 4),
+            "overkill_curve_fit_quality": round(float(overkill_fit), 4),
             "full_run_executed": False,
             "full_run_reason":  "curve_abort_projected_low",
             "stdout_tail":     debug_result.stdout[-3000:],
@@ -615,11 +1061,15 @@ def evaluate_and_update_fn(tool_context) -> str:
         }
         save_checkpoint(config.ckpt_refinement(n, m), attempt_data)
         return (
-            f"CURVE ABORT PRUNED (outer={n}, inner={m}): debug learning-curve "
-            f"projects final ng_recall={projected_ng_recall:.3f} "
+            f"CURVE ABORT PRUNED (outer={n}, inner={m}): debug learning-curves "
+            f"project final ng_recall={projected_ng_recall:.3f} "
             f"(fit_quality={curve_fit:.2f} >= {config.CURVE_ABORT_MIN_FIT}), "
             f"confidently below best ng_recall={best_ng_recall:.3f} by more than "
-            f"margin {config.CURVE_ABORT_MARGIN}; full run skipped. "
+            f"margin {config.CURVE_ABORT_MARGIN}, AND final overkill="
+            f"{projected_overkill:.3f} (fit_quality={overkill_fit:.2f} >= "
+            f"{config.CURVE_ABORT_MIN_FIT}), confidently above best overkill="
+            f"{current_best_overkill:.3f} by more than margin "
+            f"{config.CURVE_ABORT_OVERKILL_MARGIN}; full run skipped. "
             f"inner_iteration now {m_next}, no_improve_count now {no_improve}."
         )
 
@@ -641,7 +1091,7 @@ def evaluate_and_update_fn(tool_context) -> str:
     if probe_metrics:
         tool_context.state["latest_probe_metrics"] = probe_metrics
     else:
-        tool_context.state.pop("latest_probe_metrics", None)
+        _state_pop(tool_context.state, "latest_probe_metrics")
     error_analysis = parse_error_analysis(result.stdout, metrics=metrics)
 
     # Parse training diagnostic signals (P1)
@@ -665,9 +1115,9 @@ def evaluate_and_update_fn(tool_context) -> str:
 
     # Clear instrumentation flag once the script successfully emits per-sample evidence
     if error_analysis.get("available"):
-        tool_context.state.pop("error_analysis_instrumentation_required", None)
-        tool_context.state.pop("error_analysis_repair_attempted", None)
-        tool_context.state.pop("error_analysis_blocked", None)
+        _state_pop(tool_context.state, "error_analysis_instrumentation_required")
+        _state_pop(tool_context.state, "error_analysis_repair_attempted")
+        _state_pop(tool_context.state, "error_analysis_blocked")
 
     # ---- decide improvement (spec §8: P0/P1=ng_recall, P2=overkill constraint) ----
     current_metrics = {
@@ -694,15 +1144,22 @@ def evaluate_and_update_fn(tool_context) -> str:
             initially_improved=improved,
         )
         if selection_evaluation is not None:
-            tool_context.state["latest_multiseed_confirmation"] = selection_evaluation
+            if selection_evaluation.get("mode") == "board_grouped_cv":
+                tool_context.state["latest_cv_evaluation"] = selection_evaluation
+                _state_pop(tool_context.state, "latest_multiseed_confirmation")
+            else:
+                tool_context.state["latest_multiseed_confirmation"] = selection_evaluation
+                _state_pop(tool_context.state, "latest_cv_evaluation")
             if selection_evaluation.get("status") == "success":
                 metrics = _metrics_from_dict(selected_metrics)
                 new_score = float(metrics.ng_recall)
                 new_overkill = float(metrics.overkill_rate)
         else:
-            tool_context.state.pop("latest_multiseed_confirmation", None)
+            _state_pop(tool_context.state, "latest_multiseed_confirmation")
+            _state_pop(tool_context.state, "latest_cv_evaluation")
     else:
-        tool_context.state.pop("latest_multiseed_confirmation", None)
+        _state_pop(tool_context.state, "latest_multiseed_confirmation")
+        _state_pop(tool_context.state, "latest_cv_evaluation")
 
     if run_ok and metrics is not None:
         _update_refinement_population(
@@ -810,6 +1267,12 @@ def evaluate_and_update_fn(tool_context) -> str:
         "probe_rejection_reason": probe_rejection_reason,
         "prediction_verification": prediction_verification,
         AVERAGED_EVALUATION_KEY: selection_evaluation,
+        "cv_evaluation": (
+            selection_evaluation
+            if isinstance(selection_evaluation, dict)
+            and selection_evaluation.get("mode") == "board_grouped_cv"
+            else None
+        ),
         "refinement_population_count": len(tool_context.state.get("refinement_population", []) or []),
         "stdout_tail":     result.stdout[-3000:],
         "stderr_tail":     result.stderr[-1000:],
@@ -850,12 +1313,17 @@ def evaluate_and_update_fn(tool_context) -> str:
     save_checkpoint(config.CKPT_TRIED_APPROACHES, {"tried_approaches": tried})
 
     # Persistent AOI knowledge base (MLEvolve "Experience-Driven Global Memory"):
-    # append-only cross-run memory. Each record is a quadruple:
-    #   {plan, code_diff, metrics, tags}
+    # bounded cross-run memory. Each record is:
+    #   {plan, code_diff, metrics, tags, target_component, mechanism_class}
     # - code_diff is a TRUNCATED unified diff (prev best -> current); never the
     #   full script.
     # - tags is a categorical list: [failure_mode (if any), "improved"|"regressed"].
+    # - target_component/mechanism_class come from the selected strategy fingerprint
+    #   and key the dedup signature alongside tags.
     # Load the existing list first and write the whole list back — never overwrite.
+    # The append is skipped when the new record's (tags, target_component,
+    # mechanism_class) signature matches a recent record, and a FIFO cap keeps only
+    # the most recent PERSISTENT_KB_MAX_RECORDS so the memory cannot grow unbounded.
     # Wrapped so a KB write failure never raises into the evaluator hot path.
     try:
         kb_records = []
@@ -889,13 +1357,39 @@ def evaluate_and_update_fn(tool_context) -> str:
             "improved":      result_dict["improved"],
         }
 
-        kb_records.append({
+        kb_target_component = (
+            selected_fingerprint.get("target_component") or target_component
+        )
+        kb_mechanism_class = (selected_fingerprint.get("mechanism_class") or "unknown")
+
+        new_kb_record = {
             "plan": selected_strategy,
             "code_diff": make_code_diff(prev_best_script, script),
             "metrics": kb_metrics,
             "tags": kb_tags,
-        })
-        save_checkpoint(config.CKPT_PERSISTENT_KB, kb_records)
+            "target_component": kb_target_component,
+            "mechanism_class": kb_mechanism_class,
+        }
+
+        # Skip the append when an identical (tags, target_component, mechanism_class)
+        # signature already appears among the most recent records — repeated identical
+        # attempts must not flood the cross-run memory.
+        new_signature = _kb_dedup_signature(new_kb_record)
+        recent_window = kb_records[-PERSISTENT_KB_DEDUP_RECENT_WINDOW:]
+        is_recent_duplicate = any(
+            _kb_dedup_signature(rec) == new_signature for rec in recent_window
+        )
+        if is_recent_duplicate:
+            logger.info(
+                "Persistent AOI KB append skipped: signature %s matches a recent record.",
+                new_signature,
+            )
+        else:
+            kb_records.append(new_kb_record)
+            # FIFO cap — keep only the most recent PERSISTENT_KB_MAX_RECORDS.
+            if len(kb_records) > PERSISTENT_KB_MAX_RECORDS:
+                kb_records = kb_records[-PERSISTENT_KB_MAX_RECORDS:]
+            save_checkpoint(config.CKPT_PERSISTENT_KB, kb_records)
     except Exception:
         logger.exception("Persistent AOI KB write failed; continuing.")
 
@@ -921,6 +1415,9 @@ def evaluate_and_update_fn(tool_context) -> str:
         f"best={tool_context.state['current_best_score']:.4f}  "
         f"no_improve={no_improve}"
     )
+    cv_summary = _format_cv_evaluation(selection_evaluation)
+    if cv_summary:
+        summary_prefix = f"{summary_prefix}\n{cv_summary}"
 
     # ---- Priority 1a: high-overkill bounded restart ----
     # Fires when overkill >= 0.50 after INNER_STAGNATION_MAX_HIGH_OVERKILL attempts,
@@ -1159,6 +1656,10 @@ This tool:
     distinguish missing evidence from a clean run.
   - Scores per spec §8 priority: overkill_rate <= 8% is a hard gate (P2), then maximise
     ng_recall (P0/P1). A constrained solution always beats an unconstrained one.
+  - For promising candidates that pass the smoke/full-run gate, runs board-grouped
+    3-fold CV instead of separate multiseed confirmation. The returned summary
+    includes per-fold validation metrics plus aggregate worst-fold NG recall /
+    miss rate and mean overkill / accuracy.
   - Updates state["current_best_score"], state["best_overkill_rate"], and
     state["best_pipeline_script"] if improved
   - Increments inner_iteration and no_improve_count as appropriate
@@ -1171,9 +1672,10 @@ This tool:
 
 After `evaluate_and_update_fn` returns, report:
 1. The key metrics: accuracy, ng_recall, miss_rate, overkill_rate, f1, threshold
-2. Whether the script improved the best score
-3. Current loop counters: outer_iteration, inner_iteration, no_improve_count
-4. The exit decision (CONTINUE / INNER_CAP / EARLY_STOP) as returned by the tool
+2. Any BOARD_GROUPED_CV fold metrics included in the tool output
+3. Whether the script improved the best score
+4. Current loop counters: outer_iteration, inner_iteration, no_improve_count
+5. The exit decision (CONTINUE / INNER_CAP / EARLY_STOP) as returned by the tool
 
 Do NOT call any other tools. Do NOT attempt to modify loop counters manually.
 All loop state management is handled inside `evaluate_and_update_fn`.

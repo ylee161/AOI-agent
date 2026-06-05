@@ -52,13 +52,73 @@ def _script_sha(member: dict) -> str:
     return sha
 
 
+def _safe_float(value, default: float) -> float:
+    """Coerce to float, treating only ``None`` as missing (a real 0.0 miss/overkill
+    must survive — ``value or default`` would corrupt it to the worst-case default)."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _objective_tuple(member: dict) -> tuple[float, float, float, float]:
+    """(miss_rate, overkill_rate, ng_recall, accuracy) for a population member."""
+    m = member.get("metrics") or {}
+    return (
+        _safe_float(m.get("miss_rate"), 1.0),
+        _safe_float(m.get("overkill_rate"), 1.0),
+        _safe_float(m.get("ng_recall"), 0.0),
+        _safe_float(m.get("accuracy"), 0.0),
+    )
+
+
+def _goodness(member: dict) -> float:
+    """Single scalar used only to pick which of a chosen pair is the BASE: the
+    member that is better overall (lower miss/overkill, higher ng_recall/accuracy)."""
+    miss, overkill, ng_recall, accuracy = _objective_tuple(member)
+    return (ng_recall + accuracy) - (miss + overkill)
+
+
 def top_fusion_members(state: dict, k: int = 2) -> list[dict]:
-    """Return the top ``k`` archive members (already sorted best-first by the
-    evaluator: ascending overkill, then miss_rate, then higher accuracy/recall)."""
+    """Pick ``k`` archive members to fuse, favouring SPREAD across the four
+    objectives rather than a scalar rank.
+
+    The archive is now a Pareto front (no total order), so "top 2" means the two
+    members that are most DIFFERENT from each other across
+    (miss_rate, overkill_rate, ng_recall, accuracy) — fusing complementary
+    branches is what makes a cross-branch transplant worthwhile. The returned
+    pair is ordered BASE-first (the better member is the skeleton, the other is
+    the donor)."""
     population = [
         p for p in (state.get("refinement_population", []) or []) if isinstance(p, dict)
     ]
-    return population[:k]
+    if k != 2 or len(population) <= k:
+        return sorted(population, key=_goodness, reverse=True)[:k]
+
+    vectors = [_objective_tuple(p) for p in population]
+    # Normalise each objective by its range so no single axis dominates the spread.
+    ranges = []
+    for axis in range(4):
+        column = [v[axis] for v in vectors]
+        ranges.append(max(max(column) - min(column), 1e-9))
+
+    best_pair = (0, 1)
+    best_dist = -1.0
+    for i in range(len(population)):
+        for j in range(i + 1, len(population)):
+            dist = sum(
+                ((vectors[i][axis] - vectors[j][axis]) / ranges[axis]) ** 2
+                for axis in range(4)
+            )
+            if dist > best_dist:
+                best_dist = dist
+                best_pair = (i, j)
+
+    pair = [population[best_pair[0]], population[best_pair[1]]]
+    pair.sort(key=_goodness, reverse=True)  # BASE = stronger member, DONOR = other
+    return pair
 
 
 def fusion_fingerprint(member_a: dict, member_b: dict) -> dict:

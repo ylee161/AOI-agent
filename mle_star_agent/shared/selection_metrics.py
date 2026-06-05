@@ -75,6 +75,11 @@ def selection_metrics_for_record(record: Mapping[str, Any]) -> dict:
         averaged = selection_eval.get("metrics")
         if isinstance(averaged, Mapping):
             return dict(averaged)
+    cv_eval = record.get("cv_evaluation")
+    if isinstance(cv_eval, Mapping) and cv_eval.get("status") == "success":
+        metrics = cv_eval.get("metrics")
+        if isinstance(metrics, Mapping):
+            return dict(metrics)
     metrics = record.get("metrics")
     return dict(metrics) if isinstance(metrics, Mapping) else {}
 

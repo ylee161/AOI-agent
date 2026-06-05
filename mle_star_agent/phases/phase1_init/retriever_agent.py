@@ -212,8 +212,9 @@ def web_search(query: str) -> str:
         return (
             f"SEARCH_UNAVAILABLE for query {query!r} ({type(exc).__name__}). "
             "No live results returned. Use your knowledge of CURRENT (2024-2025) "
-            "small-data image-classification backbones (e.g. EfficientNet, ConvNeXt, "
-            "ViT/DeiT families) — do NOT default to a legacy ResNet18-only choice."
+            "small-data image-classification backbones (e.g. EfficientNet-B1/B2, MobileNetV3, "
+            "ResNet-50, DINOv2/CLIP frozen) — do NOT use ConvNeXt or DeiT/ViT variants "
+            "(known probe failures on this dataset) and do NOT default to ResNet18-only."
         )
 
     if not results:
@@ -381,9 +382,9 @@ You will bake these real numbers into your queries below — generic queries was
 Call `web_search` exactly four times. Build each query from the TASK PROFILE you just recorded —
 substitute the ACTUAL train size, class-imbalance wording, and modality. Use these as templates:
 1. "pretrained PyTorch image classification <TRAIN_SIZE> training samples transfer learning overfitting prevention"
-2. "lightweight CNN small dataset binary defect pass/fail classification imbalanced high precision pretrained"
-3. "PyTorch <MODALITY> surface defect detection industrial inspection pretrained backbone small data"
-4. "EfficientNet ConvNeXt ViT DeiT timm torchvision small dataset fine-tuning example code"
+2. "DINOv2 SigLIP CLIP frozen foundation model features linear probe small dataset binary defect pass/fail classification"
+3. "PyTorch <MODALITY> surface defect detection industrial inspection pretrained backbone small data DINOv2 vision foundation model"
+4. "LoRA AdaptFormer PEFT parameter-efficient fine-tuning vision transformer <TRAIN_SIZE> samples timm torchvision example code"
 
 Read every result, INCLUDING the `PAGE EXCERPT:` lines — those are real text from the source page,
 so prefer them over your own memory when writing example code (APIs change). If a query returns
@@ -393,16 +394,36 @@ backbones — never fall back to a legacy ResNet18-only set.
 ## STEP 3 — Extract 4 candidates (DIVERSE ON THE AXIS THAT MATTERS)
 From the search results, identify 4 modern, pretrained PyTorch architectures that suit binary
 industrial defect detection (pass/fail) on a dataset of only ~TRAIN_SIZE samples. For each:
-- model_name: the architecture name (e.g. "EfficientNet-B0", "ConvNeXt-Tiny", "ViT-Tiny", "DeiT-Small").
-- description: 1-2 sentences on why it suits THIS small, imbalanced binary defect task.
+- model_name: the architecture name (e.g. "EfficientNet-B0", "ConvNeXt-Tiny", "DINOv2-ViT-S/14",
+  "SigLIP-ViT-B", "CLIP-ViT-B/32").
+- description: 1-2 sentences on why it suits THIS small, imbalanced binary defect task. For a
+  frozen foundation backbone, note the adaptation method (frozen features + linear/MLP probe, or
+  parameter-efficient fine-tuning such as LoRA / AdaptFormer / PEFT) that keeps trainable params
+  tiny on ~TRAIN_SIZE samples.
 - example_code: a minimal PyTorch snippet that loads/instantiates the model with pretrained
-  weights and adapts the head for binary output (use torchvision or timm as the pages suggest).
+  weights and adapts the head for binary output (use torchvision, timm, transformers, or a PEFT
+  library as the pages suggest).
 Diversity rule — on a few-hundred-sample task, model capacity / data-hunger is the axis that
 matters, not just the family name. So your 4 MUST:
-- include at least ONE lightweight option (<10M params, e.g. EfficientNet-B0 / ConvNeXt-Nano/Tiny / MobileNetV3);
-- include at MOST two transformer-family models (transformers are data-hungry and overfit small sets);
-- span a range of sizes rather than four similarly-large models.
-Do not return four near-identical models.
+- include at least ONE lightweight option (<10M params, e.g. EfficientNet-B0/B1/B2 / MobileNetV3-Large / ResNet-50);
+- include at least ONE FROZEN self-supervised / vision-language FOUNDATION backbone (e.g. DINOv2,
+  SigLIP, or CLIP) used as a frozen feature extractor or adapted with LoRA / AdaptFormer / PEFT —
+  these transfer strongly from very few labels and are a core small-data lever, not just classic CNNs;
+- span a range of sizes/adaptation strategies rather than four similarly-large fully-fine-tuned models.
+Do not return four near-identical models, and do not return an all-classic-CNN set.
+HARD EXCLUSIONS — do NOT suggest these models under any circumstances, they have been
+empirically proven to fail the pre-training probe on this dataset every time:
+- ConvNeXt-Tiny (and any ConvNeXt variant) — outputs constant probability for all samples,
+  catastrophic overkill, prob_gap ≈ 0. Root cause: 9-channel stem adaptation breaks ConvNeXt's
+  LayerNorm-based stem; the model never learns any G/NG separation.
+- DeiT-Small (and any DeiT/ViT variant requiring patch-embedding adaptation) — outputs constant
+  low probability for all samples, recall collapses to 0. Root cause: the patch embedding is a
+  linear projection (not a conv), so the /3-repeat initialization cannot be applied cleanly;
+  the model produces no signal even after probe epochs.
+Good replacement options: EfficientNet-B1/B2/B3 (same family as B0, more capacity),
+MobileNetV3-Large (lightweight, robust on small datasets), ResNet-50 with partial unfreeze,
+or a FROZEN DINOv2/CLIP/SigLIP feature extractor (these work as frozen backbones with no
+input-layer adaptation needed).
 
 ## STEP 4 — Store
 Call `store_retrieved_candidates` with a JSON array of your 4 objects

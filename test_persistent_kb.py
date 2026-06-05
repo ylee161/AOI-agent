@@ -149,7 +149,9 @@ class EvaluatorWritesQuadrupleTests(unittest.TestCase):
                 self.assertEqual(len(records), 1)
                 record = records[0]
                 self.assertEqual(
-                    set(record.keys()), {"plan", "code_diff", "metrics", "tags"}
+                    set(record.keys()),
+                    {"plan", "code_diff", "metrics", "tags",
+                     "target_component", "mechanism_class"},
                 )
                 # plan
                 self.assertEqual(record["plan"], "focal_loss: down-weight easy negatives")

@@ -258,30 +258,47 @@ def check_stop_flag_fn(tool_context) -> str:
         results = data.get("ablation_results", [])
         if not _is_ablation_checkpoint_current(data, tool_context.state):
             logger.warning("ablation_%d.json lineage mismatch — ignoring stale checkpoint.", n)
-            return (
-                f"CONTINUE: ablation_{n}.json lineage does not match current "
-                "best pipeline, data split, acceptance config, or ablation variant set — "
-                "proceeding with fresh/recovered run."
-            )
-        if not _is_complete_ablation_results(results):
+        elif not _is_complete_ablation_results(results):
             logger.warning(
                 "ablation_%d.json has %d/%d variant results — ignoring incomplete checkpoint.",
                 n,
                 len(results),
                 NUM_ABLATION_VARIANTS,
             )
+        else:
+            tool_context.state["ablation_results"] = results
+            for r in results:
+                idx = r.get("variant_index", 0)
+                tool_context.state[f"ablation_result_{idx}"] = r
             return (
-                f"CONTINUE: ablation_{n}.json is incomplete "
-                f"({len(results)}/{NUM_ABLATION_VARIANTS}) — proceeding with recovery/fresh run."
+                f"CHECKPOINT_FOUND: loaded {len(results)} ablation result(s) for "
+                f"outer_iteration={n}. ablation_result_N keys pre-populated — "
+                "variant steps will self-skip."
             )
-        tool_context.state["ablation_results"] = results
-        for r in results:
-            idx = r.get("variant_index", 0)
-            tool_context.state[f"ablation_result_{idx}"] = r
+
+    # Aggregate checkpoint missing, stale, or incomplete — recover whatever
+    # per-variant checkpoints already exist so variant agents self-skip without
+    # re-generating scripts via LLM.
+    current_lineage = _ablation_lineage(tool_context.state)
+    recovered = []
+    for i in range(NUM_ABLATION_VARIANTS):
+        if tool_context.state.get(f"ablation_result_{i}") is not None:
+            continue
+        variant_ckpt = config.ckpt_ablation_variant(n, i)
+        if checkpoint_exists(variant_ckpt):
+            vdata = load_checkpoint(variant_ckpt)
+            if lineage_matches(vdata.get("lineage"), current_lineage):
+                tool_context.state[f"ablation_result_{i}"] = vdata
+                recovered.append(i)
+                logger.info("Pre-loaded per-variant checkpoint for variant %d into state.", i)
+            else:
+                logger.warning("Per-variant checkpoint for variant %d has lineage mismatch — will re-run.", i)
+
+    if recovered:
         return (
-            f"CHECKPOINT_FOUND: loaded {len(results)} ablation result(s) for "
-            f"outer_iteration={n}. ablation_result_N keys pre-populated — "
-            "variant steps will self-skip."
+            f"CHECKPOINT_FOUND: recovered {len(recovered)}/{NUM_ABLATION_VARIANTS} per-variant "
+            f"checkpoints for outer_iteration={n} (indices {recovered}). "
+            "ablation_result_N keys pre-populated — those variant steps will self-skip."
         )
 
     return f"CONTINUE: no stop flag, no checkpoint for outer_iteration={n} — proceeding."
