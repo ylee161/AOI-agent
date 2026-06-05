@@ -222,8 +222,26 @@ Each sample dict has: `sample_id` (str), the image path(s) for this dataset's in
    - When `DRY_RUN` is not set or `"0"`: use all samples and the full epoch count as designed.
 
 1. **Image loading (per input modality)**: Load images using the pattern specified by `load_retrieved_candidates_fn` output (`img_l`+`img_r` for stereo; `img` for mono). For **stereo**: load BOTH `img_l` AND `img_r`, compute `img_diff = torch.abs(img_l_tensor - img_r_tensor)`, and concatenate all three (L, R, diff) to form a **9-channel input** — the difference map directly encodes defect signal (G boards have near-zero abs(L-R), NG boards show localized high-difference regions). For **mono**: load the single `img` as a standard 3-channel input.
+
+   **9-channel first-conv initialisation (stereo path only)**: when adapting a pretrained backbone to accept a 9-channel first conv, initialise the new layer by repeating the pretrained 3-channel weights evenly across all three groups — do NOT leave channels 4–9 randomly initialised, as this creates noisy gradients that drown out the pretrained signal on small datasets:
+   ```python
+   new_conv = nn.Conv2d(9, old_conv.out_channels, kernel_size=old_conv.kernel_size,
+                        stride=old_conv.stride, padding=old_conv.padding,
+                        dilation=old_conv.dilation, groups=old_conv.groups,
+                        padding_mode=old_conv.padding_mode,
+                        bias=old_conv.bias is not None)
+   with torch.no_grad():
+       new_conv.weight.data = old_conv.weight.data.repeat(1, 3, 1, 1) / 3.0
+       if old_conv.bias is not None:
+           new_conv.bias.data = old_conv.bias.data.clone()
+   ```
+   If the backbone has no pretrained first conv (e.g. trained from scratch), initialise normally.
 2. **Binary labels**: G → 0, NG → 1.
-3. **Weighted loss**: compute class weights from train labels and pass to loss function (`pos_weight` for BCEWithLogitsLoss or `weight` for CrossEntropyLoss).
+3. **Weighted loss**: do NOT compute pos_weight from class counts — class balance is irrelevant to the cost asymmetry. Instead derive it from the acceptance criteria already defined in your script:
+   ```python
+   pos_weight = torch.tensor([OVERKILL_BUDGET / MISS_BUDGET])  # ≈ 2.67 for default config
+   ```
+   This encodes "I can afford to false-alarm on OVERKILL_BUDGET/MISS_BUDGET × as many good samples as I can afford to miss defects." It is self-adjusting: if config tightens MISS_BUDGET on a new dataset, pos_weight increases automatically. Pass to `BCEWithLogitsLoss(pos_weight=pos_weight.to(device))`; for `CrossEntropyLoss` (multi-class path) set `weight=torch.tensor([1.0, float(pos_weight)]).to(device)` (the weight tensor MUST be moved to `device` or CUDA logits will raise a device-mismatch error).
 4. **Threshold sweep**: after training, sweep threshold from 0.01 to 0.99 inclusive with step 0.01 on the VAL set. Use acceptance-distance selection — never pick a threshold that minimises miss_rate while ignoring overkill:
 
    ```python
@@ -275,9 +293,23 @@ Each sample dict has: `sample_id` (str), the image path(s) for this dataset's in
 6. **No data leakage**: normalisation stats must be computed on train only; threshold must be tuned on val only, never on test.
 7. **Efficient execution**: use GPU if available (`.to(device)`). Full-run `epochs` MUST be set to exactly `20` with early stopping patience `3`. Do NOT hardcode 5 — the line must read exactly `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20`. Dry-run overrides this via `DRY_RUN_EPOCHS`.
 8. **Learning-rate schedule** (MANDATORY): every script MUST use a real PyTorch learning-rate schedule instead of a fixed LR. Prefer either `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)` (SGDR) or `torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)`. Instantiate the scheduler after the optimizer and call `scheduler.step()` correctly in the training loop: for `CosineAnnealingWarmRestarts`, step once per epoch (or batch with fractional epoch); for `ReduceLROnPlateau`, call `scheduler.step(val_loss)` after validation loss is computed. The validator will hard-reject schedule-less scripts.
+
+   **Layer-wise LR (stereo 9-channel path only)**: when the model has a modified 9-channel input conv (initialised via the `/3` repeat above), split the optimizer into two parameter groups — the new stem needs a 10× higher LR than the pretrained backbone because it starts from a scaled-down initialisation:
+   ```python
+   stem_params     = list(new_conv.parameters())
+   backbone_params = [p for p in model.parameters() if not any(p is sp for sp in stem_params)]
+   optimizer = torch.optim.AdamW([
+       {{'params': stem_params,     'lr': BASE_LR}},        # e.g. 1e-3
+       {{'params': backbone_params, 'lr': BASE_LR / 10}},   # e.g. 1e-4
+   ], weight_decay=1e-3)
+   ```
+   `BASE_LR` here is the script's own base learning rate (e.g. `1e-3`); define it once and reuse it. **Ordering matters**: build this optimizer ONLY after (a) `new_conv` has been assigned back into the model (e.g. `model.conv1 = new_conv`) so its params appear in `model.parameters()`, and (b) `model.to(device)` has run — `.to(device)` rebinds parameter identities, so an optimizer created before the device move holds stale references and silently trains nothing.
+   For mono paths or feature-diff Siamese candidates (standard 3-channel convs), a single LR group is correct — do not apply this split there.
 9. **Error handling**: wrap training loop in try/except and print a clear error message if something fails.
 10. **Epoch logging** (MANDATORY): after each epoch print: `EPOCH_LOG: {{"epoch": N, "train_loss": X, "val_loss": X, "val_ng_recall": X, "val_overkill": X}}`
-11. **Pre-training probe** (MANDATORY): before full training, run a cheap probe using the capped/early training signal and print: `PROBE_METRICS: {{"ng_recall": X, "overkill_rate": X, "G_prob_mean": X, "NG_prob_mean": X, "should_continue": true/false, "reason": "..."}}`. If the probe shows catastrophic overkill, recall collapse, or no G/NG probability separation, print `should_continue: false` and exit before the full training loop.
+11. **Pre-training probe** (MANDATORY): before full training, run a cheap probe and print: `PROBE_METRICS: {{"ng_recall": X, "overkill_rate": X, "G_prob_mean": X, "NG_prob_mean": X, "should_continue": true/false, "reason": "..."}}`.
+    - **Probe epoch count**: run **at least 5 probe epochs** when the first conv was modified for 9-channel input (the `/3`-repeat init needs warm-up time before its signal is reliable); run at least 3 probe epochs for standard 3-channel or feature-diff Siamese candidates. Under `DRY_RUN=1` these minimums do NOT apply — cap probe epochs at `min(DRY_RUN_EPOCHS, the-minimum-above)` so a dry run stays cheap.
+    - **Abort conditions** — only set `should_continue: false` when the failure signal is sustained across ALL probe epochs (not just the last one): catastrophic overkill (overkill > 0.9 at threshold 0.5), recall collapse (ng_recall < 0.2 at threshold 0.5), OR no G/NG probability separation (`abs(NG_prob_mean - G_prob_mean) < 0.05`). The last condition catches cases where the model outputs near-identical scores for both classes regardless of which side of 0.5 they fall on.
 12. **Calibration statistics** (MANDATORY): after training, compute NG probability for every val sample grouped by true label and print: `CALIBRATION_STATS: {{"G_prob_mean": X, "G_prob_std": X, "NG_prob_mean": X, "NG_prob_std": X}}`
 13. **Threshold curve** (MANDATORY): during val sweep print: `THRESHOLD_CURVE: [{{"t": 0.1, "recall": X, "overkill": X, "miss_rate": X, "accuracy": X}}, ...]`
 14. **Per-sample predictions** (MANDATORY): after METRICS print ALL test sample predictions: `PREDICTIONS: [{{"sample_id": "...", "true_label": "G", "predicted_label": "NG", "ng_probability": 0.82, "threshold": 0.35}}, ...]`
