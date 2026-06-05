@@ -436,7 +436,8 @@ empirically proven to fail the pre-training probe on this dataset every time:
 Good replacement options: EfficientNet-B1/B2/B3 (same family as B0, more capacity),
 MobileNetV3-Large (lightweight, robust on small datasets), ResNet-50 with partial unfreeze,
 or a FROZEN DINOv2/CLIP/SigLIP feature extractor (these work as frozen backbones with no
-input-layer adaptation needed).
+input-layer adaptation needed — the coder will implement them as Siamese feature-diff,
+NOT 9-channel pixel diff, so the patch embedding is never modified).
 
 ## STEP 4 — Store
 Call `store_retrieved_candidates` with a JSON array of your 4 objects

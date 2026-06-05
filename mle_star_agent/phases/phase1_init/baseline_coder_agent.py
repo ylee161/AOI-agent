@@ -359,10 +359,22 @@ differ per dataset. Apply the data-loading pattern that the tool reports for thi
 input modality (stereo → 9-channel L/R/diff; mono → standard 3-channel), and follow every
 mandatory requirement above (loss weighting, threshold sweep, METRICS, diagnostics, dry-run).
 
-### Optional candidate family — FEATURE-LEVEL shared-weight Siamese difference
+### MANDATORY rule — ViT/transformer models MUST use FEATURE-LEVEL Siamese difference
 
-You MAY generate a candidate from this family in place of one of the three above
-(or as a refinement target later). It is a DIFFERENT mechanism from the 9-channel
+**If any candidate uses a Vision Transformer backbone** (ViT, DeiT, DINOv2, SigLIP,
+CLIP, BEiT, or any model whose first layer is a patch embedding / linear projection
+rather than a conv2d), you MUST use the feature-level Siamese difference family below
+instead of the 9-channel pixel-diff input. Do NOT modify the patch embedding to accept
+9 channels — this causes recall collapse (proven with DeiT-Small on this dataset).
+Feed each stereo image as a standard 3-channel input through the SHARED frozen backbone,
+then combine features as described below.
+
+CNN backbones (EfficientNet, ResNet, MobileNet, ConvNeXt, etc.) use 9-channel pixel
+diff as normal. ViT/transformer backbones always use feature-level Siamese diff.
+
+### Feature-level shared-weight Siamese difference (required for ViT backbones)
+
+It is a DIFFERENT mechanism from the 9-channel
 pixel difference and you must not conflate the two:
 
 - **9-channel pixel difference (Candidates 1–3 above):** `abs(img_l - img_r)` is
