@@ -91,6 +91,12 @@ PROBE_OVERKILL_REJECT_MAX = 0.90  # reject only catastrophic probes (ConvNeXt-st
 PROBE_NG_RECALL_REJECT_MIN = 0.80  # reject probes with severe NG recall collapse
 PROBE_PROBABILITY_GAP_MIN = 0.01  # only block truly flat models (gap≈0); let borderline cases train
 
+# Architectures permanently banned from Phase 1 candidate selection.
+# Matched case-insensitively against script name AND architecture field.
+# Scripts containing these strings are filtered from checkpoint loading so that
+# check_retriever_needed_fn triggers a fresh retrieval to find replacements.
+HARD_EXCLUDED_ARCHITECTURES = ["convnext", "deit"]
+
 # KompeteAI-style predictive early-abort on the debug smoke-run (max_epochs=1, 5% data).
 # These gates run on the METRICS the *micro-run* already prints, so an obviously-bad
 # refinement variant is pruned BEFORE paying for the 45-60 min full training run.

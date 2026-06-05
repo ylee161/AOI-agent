@@ -54,16 +54,25 @@ def load_candidate_scripts_fn(tool_context) -> str:
     if checkpoint_exists(config.CKPT_CANDIDATE_SCRIPTS):
         data = load_checkpoint(config.CKPT_CANDIDATE_SCRIPTS)
         scripts = data.get("scripts", [])
-        names = [s.get("name") for s in scripts]
-        if len(scripts) >= 3:
-            # Only update state when fully complete to avoid stale partial state.
-            tool_context.state["candidate_scripts"] = scripts
-            return f"CHECKPOINT_FOUND: loaded {len(scripts)} candidate script(s): {names} — skip generation."
-        else:
-            return (
-                f"PARTIAL_CHECKPOINT: {len(scripts)}/3 scripts already saved: {names}. "
-                f"Generate and save only the missing scripts."
-            )
+        excluded_terms = [t.lower() for t in config.HARD_EXCLUDED_ARCHITECTURES]
+        valid, skipped = [], []
+        for s in scripts:
+            key = (s.get("name", "") + " " + s.get("architecture", "")).lower()
+            if any(t in key for t in excluded_terms):
+                skipped.append(s.get("name"))
+            else:
+                valid.append(s)
+        if skipped:
+            logger.info("Filtered hard-excluded scripts from checkpoint: %s", skipped)
+        names = [s.get("name") for s in valid]
+        if len(valid) >= 3:
+            tool_context.state["candidate_scripts"] = valid
+            return f"CHECKPOINT_FOUND: loaded {len(valid)} candidate script(s): {names} — skip generation."
+        tool_context.state["candidate_scripts"] = valid
+        return (
+            f"PARTIAL_CHECKPOINT: {len(valid)}/3 valid scripts: {names} "
+            f"(skipped hard-excluded: {skipped}). Generate and save only the missing scripts."
+        )
     return "CHECKPOINT_NOT_FOUND: generate all 3 candidate scripts now."
 
 

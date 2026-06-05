@@ -253,11 +253,24 @@ def check_retriever_needed_fn(tool_context) -> str:
         return "ALREADY_RETRIEVED: state['retrieved_candidates'] is populated — skip searching."
     if checkpoint_exists(config.CKPT_CANDIDATE_SCRIPTS):
         data = load_checkpoint(config.CKPT_CANDIDATE_SCRIPTS)
-        if len(data.get("scripts", [])) >= 3:
+        scripts = data.get("scripts", [])
+        excluded_terms = [t.lower() for t in config.HARD_EXCLUDED_ARCHITECTURES]
+        valid = [
+            s for s in scripts
+            if not any(t in (s.get("name", "") + " " + s.get("architecture", "")).lower()
+                       for t in excluded_terms)
+        ]
+        if len(valid) >= 3:
             return (
-                "SCRIPTS_ALREADY_BUILT: candidate_scripts.json already has >=3 scripts — "
+                "SCRIPTS_ALREADY_BUILT: candidate_scripts.json already has >=3 valid scripts — "
                 "retrieval is unnecessary on this restart. Stop without searching."
             )
+        skipped = len(scripts) - len(valid)
+        return (
+            f"RETRIEVAL_NEEDED: only {len(valid)}/3 valid scripts in checkpoint "
+            f"({skipped} hard-excluded failed model(s) filtered out). "
+            "Proceed with web searches to find replacement architectures."
+        )
     return "RETRIEVAL_NEEDED: proceed with data-split check, then 4 web searches."
 
 
