@@ -111,6 +111,100 @@ def _attempt_label(target_component: str, fingerprint: dict | None) -> str:
     mechanism = ((fingerprint or {}).get("mechanism_class") or "unknown").strip().lower()
     return f"{target}:{mechanism}"
 
+
+def _dedupe_nonempty_strings(values) -> list[str]:
+    seen = set()
+    out: list[str] = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _mechanism_label(target_component: str | None, mechanism_class: str | None) -> str:
+    target = _normalise_target_component(str(target_component or "unknown"))
+    mechanism = str(mechanism_class or "").strip().lower()
+    if mechanism and mechanism != "unknown":
+        return f"{target}:{mechanism}"
+    return target if target != "unknown" else ""
+
+
+def _recommended_target_from_state(state: dict) -> str:
+    """Read diagnosis_brief.recommended_target without assuming schema quality."""
+    if not hasattr(state, "get"):
+        return ""
+    brief = state.get("diagnosis_brief") or {}
+    if isinstance(brief, dict):
+        target = str(brief.get("recommended_target") or "").strip()
+        if target:
+            return _normalise_target_component(target)
+    return ""
+
+
+def _helpful_mechanisms_from_state(
+    state: dict,
+    *,
+    improved: bool,
+    selected_fingerprint: dict | None,
+    code_diff: str,
+) -> list[str]:
+    """Mechanisms attached to an accepted diff; empty on missing evidence."""
+    if not improved or not code_diff:
+        return []
+    fingerprint = selected_fingerprint if isinstance(selected_fingerprint, dict) else {}
+    target = _recommended_target_from_state(state)
+    if not target:
+        return []
+    return _dedupe_nonempty_strings([
+        _mechanism_label(target, fingerprint.get("mechanism_class")),
+    ])
+
+
+def _harmful_mechanisms_from_tried_approaches(
+    tried_approaches: list,
+    outer_iteration: int,
+) -> list[str]:
+    """Failed mechanisms in the current outer cycle since the last accepted entry."""
+    entries = [e for e in (tried_approaches or []) if isinstance(e, dict)]
+    current_outer = []
+    for entry in entries:
+        try:
+            if int(entry.get("outer", -1)) == int(outer_iteration):
+                current_outer.append(entry)
+        except (TypeError, ValueError):
+            continue
+
+    last_accepted_idx = -1
+    for idx, entry in enumerate(current_outer):
+        result = entry.get("result") or {}
+        if result.get("improved") is True or entry.get("failure_reason") == "accepted":
+            last_accepted_idx = idx
+
+    rejected = []
+    for entry in current_outer[last_accepted_idx + 1:]:
+        result = entry.get("result") or {}
+        failure_reason = str(entry.get("failure_reason") or "").strip().lower()
+        rejected_reason = failure_reason in {
+            "no_improvement",
+            "recall_regression",
+            "overkill_regression",
+        }
+        if result.get("improved") is not False and not rejected_reason:
+            continue
+        fingerprint = entry.get("strategy_fingerprint") or {}
+        target = (
+            entry.get("target_component")
+            or (fingerprint if isinstance(fingerprint, dict) else {}).get("target_component")
+        )
+        mechanism = (
+            fingerprint if isinstance(fingerprint, dict) else {}
+        ).get("mechanism_class")
+        rejected.append(_mechanism_label(target, mechanism))
+    return _dedupe_nonempty_strings(rejected)
+
 def _save_best_pipeline(state: dict) -> None:
     """Persist the authoritative resume snapshot to best_pipeline.json."""
     current_best_score = float(state.get("current_best_score", 0.0) or 0.0)
@@ -846,6 +940,7 @@ def evaluate_and_update_fn(tool_context) -> str:
     current_best_accuracy = float(tool_context.state.get("best_accuracy", 0.0))
     current_best_f1 = float(tool_context.state.get("best_f1", 0.0))
     no_improve           = int(tool_context.state.get("no_improve_count", 0))
+    generation_fails     = int(tool_context.state.get("generation_fail_count", 0))
 
     # ---- debug pre-check: fast smoke run before paying for the full run ----
     # Patches the script to max_epochs=1 + 5% data and caps the timeout at
@@ -882,9 +977,11 @@ def evaluate_and_update_fn(tool_context) -> str:
         )
         m_next = m + 1
         tool_context.state["inner_iteration"] = m_next
-        no_improve += 1
-        tool_context.state["no_improve_count"] = no_improve
-
+        generation_fails += 1
+        tool_context.state["generation_fail_count"] = generation_fails
+        if generation_fails >= config.GENERATION_FAIL_MAX:
+            no_improve += 1
+            tool_context.state["no_improve_count"] = no_improve
         config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         attempt_data = {
             "outer_iteration": n,
@@ -899,6 +996,7 @@ def evaluate_and_update_fn(tool_context) -> str:
             "current_best_score":   float(tool_context.state.get("current_best_score", 0.0)),
             "current_best_overkill": float(tool_context.state.get("best_overkill_rate", 1.0)),
             "no_improve_count":   no_improve,
+            "generation_fail_count": generation_fails,
             "metrics":         None,
             "smoke_metrics":    smoke_record["metrics"],
             "smoke_score":      smoke_record["score"],
@@ -934,9 +1032,11 @@ def evaluate_and_update_fn(tool_context) -> str:
         )
         m_next = m + 1
         tool_context.state["inner_iteration"] = m_next
-        no_improve += 1
-        tool_context.state["no_improve_count"] = no_improve
-
+        generation_fails += 1
+        tool_context.state["generation_fail_count"] = generation_fails
+        if generation_fails >= config.GENERATION_FAIL_MAX:
+            no_improve += 1
+            tool_context.state["no_improve_count"] = no_improve
         config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         attempt_data = {
             "outer_iteration": n,
@@ -946,6 +1046,7 @@ def evaluate_and_update_fn(tool_context) -> str:
             "duration_ms":     round(debug_result.duration_ms, 1),
             "improved":        False,
             "failure_reason":  "debug_predicted_low_utility",
+            "generation_fail_count": generation_fails,
             "new_score":       0.0,
             "new_overkill":    1.0,
             "current_best_score":   float(tool_context.state.get("current_best_score", 0.0)),
@@ -1199,12 +1300,24 @@ def evaluate_and_update_fn(tool_context) -> str:
         tool_context.state["best_selection_evaluation"] = selection_evaluation
         tool_context.state["best_pipeline_script"] = script
         tool_context.state["no_improve_count"]     = 0
+        tool_context.state["generation_fail_count"] = 0
         no_improve = 0
+        generation_fails = 0
         logger.info(
             "New best: ng_recall=%.4f overkill=%.4f (was ng_recall=%.4f overkill=%.4f)",
             new_score, new_overkill, current_best, current_best_overkill,
         )
+    elif probe_rejected or not run_ok:
+        # Script never trained — count as generation failure, not training failure.
+        generation_fails += 1
+        tool_context.state["generation_fail_count"] = generation_fails
+        if generation_fails >= config.GENERATION_FAIL_MAX:
+            no_improve += 1
+            tool_context.state["no_improve_count"] = no_improve
     else:
+        # Full training ran but didn't improve — counts against patience.
+        generation_fails = 0
+        tool_context.state["generation_fail_count"] = generation_fails
         no_improve += 1
         tool_context.state["no_improve_count"] = no_improve
 
@@ -1280,7 +1393,8 @@ def evaluate_and_update_fn(tool_context) -> str:
     save_checkpoint(config.ckpt_refinement(n, m), attempt_data)
 
     # Append to tried_approaches memory (P4)
-    tried = list(tool_context.state.get("tried_approaches", []) or [])
+    prior_tried = list(tool_context.state.get("tried_approaches", []) or [])
+    tried = list(prior_tried)
     plan = tool_context.state.get("refinement_plan") or {}
     selected_strategy = tool_context.state.get("selected_refinement_strategy", "")
     result_dict = {
@@ -1361,14 +1475,26 @@ def evaluate_and_update_fn(tool_context) -> str:
             selected_fingerprint.get("target_component") or target_component
         )
         kb_mechanism_class = (selected_fingerprint.get("mechanism_class") or "unknown")
+        kb_code_diff = make_code_diff(prev_best_script, script)
+        tried_for_harmful = tried if not improved else prior_tried
 
         new_kb_record = {
             "plan": selected_strategy,
-            "code_diff": make_code_diff(prev_best_script, script),
+            "code_diff": kb_code_diff,
             "metrics": kb_metrics,
             "tags": kb_tags,
             "target_component": kb_target_component,
             "mechanism_class": kb_mechanism_class,
+            "helpful_mechanisms": _helpful_mechanisms_from_state(
+                tool_context.state,
+                improved=improved,
+                selected_fingerprint=selected_fingerprint,
+                code_diff=kb_code_diff,
+            ),
+            "harmful_mechanisms": _harmful_mechanisms_from_tried_approaches(
+                tried_for_harmful,
+                n,
+            ),
         }
 
         # Skip the append when an identical (tags, target_component, mechanism_class)

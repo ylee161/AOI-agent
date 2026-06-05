@@ -74,7 +74,8 @@ NO_IMPROVE_MAX = 2              # patience once final acceptance is met
 NO_IMPROVE_MAX_CONSTRAINED = 5  # patience once relaxed (but not final) acceptance is met
 INNER_STAGNATION_MAX_UNCONSTRAINED = 5  # restart outer diagnosis when below relaxed and stuck
 HIGH_OVERKILL_STAGNATION_THRESHOLD = 0.50   # overkill above this is considered catastrophic
-INNER_STAGNATION_MAX_HIGH_OVERKILL = 3      # max inner attempts before forcing new diagnosis when overkill is catastrophic
+INNER_STAGNATION_MAX_HIGH_OVERKILL = 6      # max inner attempts before forcing new diagnosis when overkill is catastrophic
+GENERATION_FAIL_MAX = 5         # max probe/debug/script-crash failures before counting as no_improve
 TARGET_COMPONENT_ROTATION_LOCK_FAILED_ATTEMPTS = 6
 SUBMISSION_RETRY_MAX = 2  # max Phase 2→3→4 retry cycles if submission fails relaxed minimum
 
