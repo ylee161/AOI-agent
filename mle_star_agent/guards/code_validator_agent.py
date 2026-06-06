@@ -89,6 +89,34 @@ def generated_script_contract_rejection_reasons(script: str) -> list[str]:
         f"missing required marker {marker}"
         for marker in missing_required_full_run_markers(script)
     ]
+    compact = re.sub(r"\s+", "", script)
+    non_comment_script = "\n".join(
+        line for line in script.splitlines() if not re.match(r"^\s*#", line)
+    )
+    has_zero_padding_init = (
+        re.search(r"weight\s*\[\s*:\s*,\s*3\s*:\s*\]\s*=\s*0", script) is not None
+        or re.search(r"weight\s*\[\s*:\s*,\s*3\s*\]\s*=\s*0", script) is not None
+        or "zeros_like" in script
+    )
+    if has_zero_padding_init and "repeat(1,3,1,1)" not in compact:
+        reasons.append(
+            "9-channel init uses zero-padding instead of /3 repeat trick -- causes catastrophic overkill at probe"
+        )
+    if "OVERKILL_BUDGET/MISS_BUDGET" in compact and "pos_weight" in script:
+        reasons.append(
+            "pos_weight uses OVERKILL_BUDGET/MISS_BUDGET ratio instead of class counts -- empirically collapses ng_recall"
+        )
+    if (
+        re.search(
+            r"(?<![A-Za-z0-9_])(?:dinov2|siglip|ViT|vit_b|vit_s|DeiT|deit|BEiT|beit|clip)(?![A-Za-z0-9_])",
+            non_comment_script,
+        )
+        is not None
+        and re.search(r"FEATURE_DIFF_CANDIDATE\s*=\s*True", script) is None
+    ):
+        reasons.append(
+            "ViT/transformer backbone detected without FEATURE_DIFF_CANDIDATE=True -- patch embedding must not be adapted to 9-channel input"
+        )
     if _EPOCH_TERNARY_CONTRACT_RE.search(script) is None:
         reasons.append(
             "missing epoch ternary: epochs = DRY_RUN_EPOCHS if DRY_RUN else"
