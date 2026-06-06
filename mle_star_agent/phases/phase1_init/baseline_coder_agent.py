@@ -161,10 +161,30 @@ def load_retrieved_candidates_fn(tool_context) -> str:
     )
 
 
+def get_script_template_fn(tool_context) -> str:
+    """Return the mandatory script template. The LLM fills ONLY the architecture block."""
+    from mle_star_agent.shared.script_template import get_script_template
+
+    modality = tool_context.state.get('input_modality', 'stereo')
+    # Fallback supports older configs that predate the grouped split checkpoint attr.
+    data_split_ckpt = getattr(config, 'CKPT_DATA_SPLIT', config.CHECKPOINT_DIR / 'data_split_grouped.json')
+    data_split_path = str(data_split_ckpt)
+    template = get_script_template(data_split_path=data_split_path, input_modality=modality)
+    tool_context.state['script_template'] = template
+    return (
+        'TEMPLATE_LOADED: The script template is now in state["script_template"]. '
+        'You must fill ONLY the section between "<<< ARCHITECTURE BLOCK START >>>" and '
+        '"<<< ARCHITECTURE BLOCK END >>>". Do NOT modify anything outside that block. '
+        'The template already handles: data loading, pos_weight (n_g/n_ng), probe logic, '
+        'training loop, isotonic calibration, threshold sweep, and all METRICS output.'
+    )
+
+
 _ensure_data_split_tool = FunctionTool(func=ensure_data_split_fn)
 _load_candidate_scripts_tool = FunctionTool(func=load_candidate_scripts_fn)
 _append_candidate_script_tool = FunctionTool(func=append_candidate_script_fn)
 _load_retrieved_candidates_tool = FunctionTool(func=load_retrieved_candidates_fn)
+_get_script_template_tool = FunctionTool(func=get_script_template_fn)
 
 # ---------------------------------------------------------------------------
 # Agent instruction
@@ -194,6 +214,19 @@ Call `load_candidate_scripts_fn`.
 
 ---
 ## STEP 3 — Generate 3 candidate training scripts
+
+**FIRST call `get_script_template_fn` to load the mandatory template.**
+You will fill ONLY the architecture block — everything else is pre-written and correct.
+Do NOT rewrite the data loading, pos_weight, probe, training loop, threshold sweep, or METRICS sections.
+
+For each candidate architecture, produce ONLY the architecture block content:
+1. Model class definition (or imports + instantiation for pretrained models)
+2. build_model() function that returns model on `device`
+3. Optimizer definition (AdamW recommended, lr=1e-3)
+4. Scheduler definition (CosineAnnealingWarmRestarts(T_0=10, eta_min=1e-6))
+5. PROBE_EPOCHS constant
+
+Then call append_candidate_script_fn with the COMPLETE script (template with your architecture block inserted).
 
 FIRST call `load_retrieved_candidates_fn`. It returns the candidate model menu discovered by
 A_retriever (the retriever agent ran before you and stored 4 candidates in state) plus the
@@ -464,6 +497,7 @@ baseline_coder_agent = LlmAgent(
         _ensure_data_split_tool,
         _load_candidate_scripts_tool,
         _load_retrieved_candidates_tool,
+        _get_script_template_tool,
         _append_candidate_script_tool,
         code_validator_tool,
         store_validation_cache_tool,
