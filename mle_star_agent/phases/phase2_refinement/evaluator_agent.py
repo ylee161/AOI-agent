@@ -1439,85 +1439,95 @@ def evaluate_and_update_fn(tool_context) -> str:
     # mechanism_class) signature matches a recent record, and a FIFO cap keeps only
     # the most recent PERSISTENT_KB_MAX_RECORDS so the memory cannot grow unbounded.
     # Wrapped so a KB write failure never raises into the evaluator hot path.
-    try:
-        kb_records = []
-        if checkpoint_exists(config.CKPT_PERSISTENT_KB):
-            existing_kb = load_checkpoint(config.CKPT_PERSISTENT_KB)
-            if isinstance(existing_kb, list):
-                kb_records = list(existing_kb)
-
-        # failure_mode lives under failure_classification in diagnosis_brief
-        # (primary) or diagnosis_report (mirror). Empty-safe.
-        failure_mode = ""
-        for source_key in ("diagnosis_brief", "diagnosis_report"):
-            blob = tool_context.state.get(source_key) or {}
-            if isinstance(blob, dict):
-                classification = blob.get("failure_classification") or {}
-                if isinstance(classification, dict):
-                    failure_mode = (classification.get("failure_mode") or "").strip()
-                    if failure_mode:
-                        break
-
-        kb_tags = []
-        if failure_mode:
-            kb_tags.append(failure_mode)
-        kb_tags.append("improved" if improved else "regressed")
-
-        kb_metrics = {
-            "ng_recall":     result_dict["ng_recall"],
-            "miss_rate":     result_dict["miss_rate"],
-            "overkill_rate": result_dict["overkill"],
-            "accuracy":      result_dict["accuracy"],
-            "improved":      result_dict["improved"],
-        }
-
-        kb_target_component = (
-            selected_fingerprint.get("target_component") or target_component
+    # Guard: skip KB write for stub scripts (no real training output) or when
+    # metrics are absent — these would poison the KB with fake results.
+    _script_is_stub = len((script or "").strip().splitlines()) < 10
+    _metrics_are_real = metrics is not None and getattr(metrics, "roc_auc", 0) > 0
+    if _script_is_stub or not _metrics_are_real:
+        logger.info(
+            "Persistent AOI KB write skipped: script is stub (%s) or metrics absent/zero roc_auc (%s).",
+            _script_is_stub, not _metrics_are_real,
         )
-        kb_mechanism_class = (selected_fingerprint.get("mechanism_class") or "unknown")
-        kb_code_diff = make_code_diff(prev_best_script, script)
-        tried_for_harmful = tried if not improved else prior_tried
+    else:
+        try:
+            kb_records = []
+            if checkpoint_exists(config.CKPT_PERSISTENT_KB):
+                existing_kb = load_checkpoint(config.CKPT_PERSISTENT_KB)
+                if isinstance(existing_kb, list):
+                    kb_records = list(existing_kb)
 
-        new_kb_record = {
-            "plan": selected_strategy,
-            "code_diff": kb_code_diff,
-            "metrics": kb_metrics,
-            "tags": kb_tags,
-            "target_component": kb_target_component,
-            "mechanism_class": kb_mechanism_class,
-            "helpful_mechanisms": _helpful_mechanisms_from_state(
-                tool_context.state,
-                improved=improved,
-                selected_fingerprint=selected_fingerprint,
-                code_diff=kb_code_diff,
-            ),
-            "harmful_mechanisms": _harmful_mechanisms_from_tried_approaches(
-                tried_for_harmful,
-                n,
-            ),
-        }
+            # failure_mode lives under failure_classification in diagnosis_brief
+            # (primary) or diagnosis_report (mirror). Empty-safe.
+            failure_mode = ""
+            for source_key in ("diagnosis_brief", "diagnosis_report"):
+                blob = tool_context.state.get(source_key) or {}
+                if isinstance(blob, dict):
+                    classification = blob.get("failure_classification") or {}
+                    if isinstance(classification, dict):
+                        failure_mode = (classification.get("failure_mode") or "").strip()
+                        if failure_mode:
+                            break
 
-        # Skip the append when an identical (tags, target_component, mechanism_class)
-        # signature already appears among the most recent records — repeated identical
-        # attempts must not flood the cross-run memory.
-        new_signature = _kb_dedup_signature(new_kb_record)
-        recent_window = kb_records[-PERSISTENT_KB_DEDUP_RECENT_WINDOW:]
-        is_recent_duplicate = any(
-            _kb_dedup_signature(rec) == new_signature for rec in recent_window
-        )
-        if is_recent_duplicate:
-            logger.info(
-                "Persistent AOI KB append skipped: signature %s matches a recent record.",
-                new_signature,
+            kb_tags = []
+            if failure_mode:
+                kb_tags.append(failure_mode)
+            kb_tags.append("improved" if improved else "regressed")
+
+            kb_metrics = {
+                "ng_recall":     result_dict["ng_recall"],
+                "miss_rate":     result_dict["miss_rate"],
+                "overkill_rate": result_dict["overkill"],
+                "accuracy":      result_dict["accuracy"],
+                "improved":      result_dict["improved"],
+            }
+
+            kb_target_component = (
+                selected_fingerprint.get("target_component") or target_component
             )
-        else:
-            kb_records.append(new_kb_record)
-            # FIFO cap — keep only the most recent PERSISTENT_KB_MAX_RECORDS.
-            if len(kb_records) > PERSISTENT_KB_MAX_RECORDS:
-                kb_records = kb_records[-PERSISTENT_KB_MAX_RECORDS:]
-            save_checkpoint(config.CKPT_PERSISTENT_KB, kb_records)
-    except Exception:
-        logger.exception("Persistent AOI KB write failed; continuing.")
+            kb_mechanism_class = (selected_fingerprint.get("mechanism_class") or "unknown")
+            kb_code_diff = make_code_diff(prev_best_script, script)
+            tried_for_harmful = tried if not improved else prior_tried
+
+            new_kb_record = {
+                "plan": selected_strategy,
+                "code_diff": kb_code_diff,
+                "metrics": kb_metrics,
+                "tags": kb_tags,
+                "target_component": kb_target_component,
+                "mechanism_class": kb_mechanism_class,
+                "helpful_mechanisms": _helpful_mechanisms_from_state(
+                    tool_context.state,
+                    improved=improved,
+                    selected_fingerprint=selected_fingerprint,
+                    code_diff=kb_code_diff,
+                ),
+                "harmful_mechanisms": _harmful_mechanisms_from_tried_approaches(
+                    tried_for_harmful,
+                    n,
+                ),
+            }
+
+            # Skip the append when an identical (tags, target_component, mechanism_class)
+            # signature already appears among the most recent records — repeated identical
+            # attempts must not flood the cross-run memory.
+            new_signature = _kb_dedup_signature(new_kb_record)
+            recent_window = kb_records[-PERSISTENT_KB_DEDUP_RECENT_WINDOW:]
+            is_recent_duplicate = any(
+                _kb_dedup_signature(rec) == new_signature for rec in recent_window
+            )
+            if is_recent_duplicate:
+                logger.info(
+                    "Persistent AOI KB append skipped: signature %s matches a recent record.",
+                    new_signature,
+                )
+            else:
+                kb_records.append(new_kb_record)
+                # FIFO cap — keep only the most recent PERSISTENT_KB_MAX_RECORDS.
+                if len(kb_records) > PERSISTENT_KB_MAX_RECORDS:
+                    kb_records = kb_records[-PERSISTENT_KB_MAX_RECORDS:]
+                save_checkpoint(config.CKPT_PERSISTENT_KB, kb_records)
+        except Exception:
+            logger.exception("Persistent AOI KB write failed; continuing.")
 
     # Build a human-readable metrics line for the return value
     if probe_rejected:
