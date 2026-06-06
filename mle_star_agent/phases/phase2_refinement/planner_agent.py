@@ -316,12 +316,19 @@ def _kb_record_prompt_view(record: dict) -> dict:
     diff = record.get("code_diff") or ""  # legacy records lack code_diff -> ""
     diff_excerpt = diff[:160].replace("\n", "\\n")
     metrics = record.get("metrics") or {}
-    return {
+    view = {
         "plan": record.get("plan", ""),
         "tags": _kb_record_tags(record),
         "ng_recall": metrics.get("ng_recall"),
         "diff_excerpt": diff_excerpt,
     }
+    helpful = [str(m) for m in (record.get("helpful_mechanisms") or []) if m]
+    harmful = [str(m) for m in (record.get("harmful_mechanisms") or []) if m]
+    if helpful or harmful:
+        view["mechanisms"] = (
+            f"Helped: {', '.join(helpful)} | Hurt: {', '.join(harmful)}"
+        )
+    return view
 
 
 def _persistent_kb_summary(failure_mode: str | None = None, k: int = 6) -> str:

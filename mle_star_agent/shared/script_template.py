@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import functional as TF
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
+from skimage.exposure import match_histograms
 from PIL import Image
 
 DRY_RUN         = os.getenv('DRY_RUN') == '1'
@@ -57,15 +58,20 @@ def _normalize_group(tensor):
 
 
 class StereoDataset(Dataset):
-    def __init__(self, samples, augment=True):
+    def __init__(self, samples, augment=True, reference_samples=None):
         self.samples = samples
         self.augment = augment
+        reference_pool = reference_samples if reference_samples is not None else samples
+        reference_sample = next((s for s in reference_pool if s['label'] == 'G'), reference_pool[0])
+        self.reference_image = Image.open(reference_sample['img_l']).convert('RGB')
 
     def __len__(self):
         return len(self.samples)
 
     def _load_rgb(self, path):
-        return Image.open(path).convert('RGB')
+        image = Image.open(path).convert('RGB')
+        matched = match_histograms(np.array(image), np.array(self.reference_image), channel_axis=-1)
+        return Image.fromarray(np.clip(matched, 0, 255).astype(np.uint8))
 
     def _transform_pair(self, img_l, img_r):
         img_l = TF.resize(img_l, [IMAGE_SIZE, IMAGE_SIZE])
@@ -104,9 +110,9 @@ class StereoDataset(Dataset):
         return image, label, sample_id
 
 
-train_loader = DataLoader(StereoDataset(train_samples, augment=True), batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-val_loader   = DataLoader(StereoDataset(val_samples, augment=False), batch_size=BATCH_SIZE, shuffle=False)
-test_loader  = DataLoader(StereoDataset(test_samples, augment=False), batch_size=BATCH_SIZE, shuffle=False)
+train_loader = DataLoader(StereoDataset(train_samples, augment=True, reference_samples=train_samples), batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+val_loader   = DataLoader(StereoDataset(val_samples, augment=False, reference_samples=train_samples), batch_size=BATCH_SIZE, shuffle=False)
+test_loader  = DataLoader(StereoDataset(test_samples, augment=False, reference_samples=train_samples), batch_size=BATCH_SIZE, shuffle=False)
 
 # <<< ARCHITECTURE BLOCK START >>>
 # The LLM fills in: model class definition, build_model() function,
