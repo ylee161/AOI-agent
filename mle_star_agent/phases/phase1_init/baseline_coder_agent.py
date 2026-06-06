@@ -246,11 +246,17 @@ Each sample dict has: `sample_id` (str), the image path(s) for this dataset's in
    ```
    If the backbone has no pretrained first conv (e.g. trained from scratch), initialise normally.
 2. **Binary labels**: G → 0, NG → 1.
-3. **Weighted loss**: do NOT compute pos_weight from class counts — class balance is irrelevant to the cost asymmetry. Instead derive it from the acceptance criteria already defined in your script:
+3. **Weighted loss**: compute pos_weight from the ACTUAL class counts in the training split —
+   do NOT use OVERKILL_BUDGET/MISS_BUDGET (empirically proven to produce ng_recall≈0.05 on
+   this dataset vs ng_recall≈0.29 with class-count weighting):
    ```python
-   pos_weight = torch.tensor([OVERKILL_BUDGET / MISS_BUDGET])  # ≈ 2.67 for default config
+   n_ng = sum(1 for s in train_samples if s["label"] == "NG")
+   n_g  = sum(1 for s in train_samples if s["label"] == "G")
+   pos_weight = torch.tensor([n_g / n_ng])   # standard class-imbalance correction
    ```
-   This encodes "I can afford to false-alarm on OVERKILL_BUDGET/MISS_BUDGET × as many good samples as I can afford to miss defects." It is self-adjusting: if config tightens MISS_BUDGET on a new dataset, pos_weight increases automatically. Pass to `BCEWithLogitsLoss(pos_weight=pos_weight.to(device))`; for `CrossEntropyLoss` (multi-class path) set `weight=torch.tensor([1.0, float(pos_weight)]).to(device)` (the weight tensor MUST be moved to `device` or CUDA logits will raise a device-mismatch error).
+   Pass to `BCEWithLogitsLoss(pos_weight=pos_weight.to(device))`; for `CrossEntropyLoss`
+   (multi-class path) set `weight=torch.tensor([1.0, float(pos_weight)]).to(device)` (the
+   weight tensor MUST be moved to `device` or CUDA logits will raise a device-mismatch error).
 4. **Threshold sweep**: after training, sweep threshold from 0.01 to 0.99 inclusive with step 0.01 on the VAL set. Select the operating point with the strict **Stage 0 → 1 → 2** priority below — miss_rate protection (P0) is always resolved before overkill reduction (P2). Do NOT use acceptance-distance averaging or any blended score as the primary objective; the Phase 2 validator (CHECK 2B) hard-rejects that contract:
 
    ```python

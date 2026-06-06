@@ -281,6 +281,15 @@ backbone.conv1 = new_conv  # replace the layer
 This divides pretrained RGB weights by 3 and tiles them across all 3 channel groups
 (L, R, |L-R|), so the backbone starts with meaningful signal from all 9 channels.
 
+**MANDATORY — weighted loss pos_weight from class counts (NOT budget ratios):**
+Do NOT use `OVERKILL_BUDGET / MISS_BUDGET` as pos_weight — empirically proven to collapse
+ng_recall to ≈0.05. Always compute from the training split:
+```python
+n_ng = sum(1 for s in train_samples if s["label"] == "NG")
+n_g  = sum(1 for s in train_samples if s["label"] == "G")
+pos_weight = torch.tensor([n_g / n_ng]).to(device)
+```
+
 Required properties:
 - Load both _L and _R stereo images for all components that use visual input
 - Load Excel labels via the split in `__DATA_SPLIT_PATH__` — the script runs as a standalone process with no ADK state access. Use: `import json; data_split = json.load(open("__DATA_SPLIT_PATH__"))`

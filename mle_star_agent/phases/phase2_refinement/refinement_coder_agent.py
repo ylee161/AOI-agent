@@ -402,7 +402,13 @@ The script must:
   ```
 - Load both _L and _R stereo images (unless a prior ablation proved stereo is not useful)
 - Load Excel labels
-- Train with weighted loss (unless explicitly changing this)
+- Train with weighted loss using class-count pos_weight — do NOT use OVERKILL_BUDGET/MISS_BUDGET
+  (empirically proven to collapse ng_recall to ≈0.05). Always compute from training data:
+  ```python
+  n_ng = sum(1 for s in train_samples if s["label"] == "NG")
+  n_g  = sum(1 for s in train_samples if s["label"] == "G")
+  pos_weight = torch.tensor([n_g / n_ng]).to(device)
+  ```
 - When `state["best_overkill_rate"] > 0.08` **AND** `state["best_miss_rate"] <= 0.03`,
   include executable dynamic FP penalty code:
   `fp_weight = 1.0 + 5.0 * max(0, best_overkill_rate - 0.08)` applied to a
