@@ -1,5 +1,6 @@
 import json as _json
 import logging
+import re
 import time
 
 from google.adk.agents import LlmAgent, SequentialAgent
@@ -562,6 +563,10 @@ def _make_variant_step_agent(variant_index: int) -> LlmAgent:
     variant = ABLATION_VARIANTS[variant_index]
     variant_name = variant["name"]
     variant_desc = variant["description"]
+    # ADK requires LlmAgent.name to be a valid Python identifier, but factorial
+    # variant names contain '=' (e.g. "stereo_fusion=off_..."). Sanitize for the
+    # node name only; variant_name stays intact everywhere it's data/display.
+    safe_variant_name = re.sub(r"\W", "_", variant_name)
 
     save_fn = _make_save_script_fn(variant_index)
     save_tool = FunctionTool(func=save_fn)
@@ -640,7 +645,7 @@ error summary if execution failed.
 """
 
     return LlmAgent(
-        name=f"ablation_step_{variant_index}_{variant_name}",
+        name=f"ablation_step_{variant_index}_{safe_variant_name}",
         model=config.MODEL_PRO,
         description=f"Generates, validates, and runs ablation variant {variant_index}: {variant_name}.",
         instruction=instruction,
