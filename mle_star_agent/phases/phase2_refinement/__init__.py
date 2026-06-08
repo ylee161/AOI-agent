@@ -12,9 +12,10 @@ from mle_star_agent.phases.phase2_refinement.planner_agent import (
     refinement_planner_agent,
     strategy_gate_agent,
 )
+from mle_star_agent.phases.phase2_refinement.reflexion_agent import reflexion_agent
 from mle_star_agent.phases.phase2_refinement.refinement_coder_agent import refinement_coder_agent
 
-# Inner loop: error_analysis_gate → planner → strategy_gate → refinement_coder → evaluator → error_analysis,
+# Inner loop: error_analysis_gate → reflexion → planner → strategy_gate → refinement_coder → evaluator → error_analysis,
 # up to INNER_LOOP_MAX iterations.
 # evaluator_agent escalates (via FunctionTool) when the inner cap is reached
 # or an early-stop condition fires; LoopAgent.max_iterations is a safety ceiling.
@@ -28,6 +29,7 @@ inner_loop_agent = loop_agent.LoopAgent(
     max_iterations=config.INNER_LOOP_MAX,
     sub_agents=[
         error_analysis_gate_agent,
+        reflexion_agent,
         refinement_planner_agent,
         strategy_gate_agent,
         refinement_coder_agent,

@@ -123,7 +123,8 @@ test_loader  = DataLoader(StereoDataset(test_samples, augment=False, reference_s
 #   - For ViT backbones: set FEATURE_DIFF_CANDIDATE=True and use Siamese feature-diff (no patch embedding modification)
 #   - optimizer and scheduler must be defined
 #   - PROBE_EPOCHS = min(DRY_RUN_EPOCHS, 5) if DRY_RUN else 5  (9-channel CNN)
-#   - PROBE_EPOCHS = min(DRY_RUN_EPOCHS, 3) if DRY_RUN else 3  (3-channel / FEATURE_DIFF)
+#   - PROBE_EPOCHS = min(DRY_RUN_EPOCHS, 8) if DRY_RUN else 8  (FEATURE_DIFF / ViT / DINOv2 — frozen backbone needs more warm-up)
+#   - For DINOv2/ViT: MUST partially unfreeze (e.g. unfreeze last 6 transformer blocks) from epoch 0 — a fully frozen backbone + random head will never develop prob_gap in any number of probe epochs
 # <<< ARCHITECTURE BLOCK END >>>
 model = build_model()
 

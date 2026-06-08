@@ -55,6 +55,18 @@ def load_candidate_scripts_fn(tool_context) -> str:
         data = load_checkpoint(config.CKPT_CANDIDATE_SCRIPTS)
         scripts = data.get("scripts", [])
         excluded_terms = [t.lower() for t in config.HARD_EXCLUDED_ARCHITECTURES]
+        # Also exclude architectures that failed at runtime in a prior session,
+        # so the baseline coder never reloads scripts for a known-bad backbone.
+        if checkpoint_exists(config.CKPT_FAILED_ARCHITECTURES):
+            try:
+                fa_data = load_checkpoint(config.CKPT_FAILED_ARCHITECTURES)
+                for e in fa_data.get("failed", []):
+                    for field in ("name", "architecture"):
+                        val = (e.get(field) or "").strip().lower()
+                        if val and val not in excluded_terms:
+                            excluded_terms.append(val)
+            except Exception:
+                logger.warning("failed_architectures.json unreadable in baseline coder — runtime bans skipped.")
         valid, skipped = [], []
         for s in scripts:
             key = (s.get("name", "") + " " + s.get("architecture", "")).lower()

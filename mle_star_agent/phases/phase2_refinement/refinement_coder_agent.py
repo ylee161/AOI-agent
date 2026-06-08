@@ -12,6 +12,7 @@ from mle_star_agent.shared.callbacks import (
     rate_limit_retry_callback,
 )
 from mle_star_agent.shared.checkpoint_io import checkpoint_exists, load_checkpoint
+from mle_star_agent.shared.optuna_template import get_optuna_block
 from mle_star_agent.phases.phase2_refinement import fusion
 
 logger = logging.getLogger(__name__)
@@ -168,6 +169,37 @@ def load_fusion_scripts_fn(tool_context) -> str:
 
 
 _load_fusion_scripts_tool = FunctionTool(func=load_fusion_scripts_fn)
+
+
+def inject_optuna_block_fn(tool_context) -> str:
+    """
+    Return the Optuna Bayesian-search code block for an `optimizer/lr-schedule`
+    refinement, or the sentinel `OPTUNA_NOT_APPLICABLE` for any other target.
+
+    Call this ONLY when SELECTED_STRATEGY_FINGERPRINT.target_component is
+    `optimizer/lr-schedule`. The returned block defines `_optuna_objective`, runs
+    a seeded TPE study over lr / weight_decay / optimizer / scheduler and their
+    sub-params (using the script's existing `build_model`, `train_loader`,
+    `val_loader`, `pos_weight`, `device`), and leaves `optimizer`, `scheduler`,
+    and `best_params` in scope for the main training loop. Splice it verbatim
+    into the script just BEFORE the main training loop. When fewer than
+    `OPTUNA_MIN_TRIALS` trials complete it sets `best_params = None`, so the main
+    loop must wrap the Optuna-built optimizer/scheduler in `if best_params is None:`
+    to fall back to your LLM-written optimizer/scheduler.
+    """
+    fingerprint = tool_context.state.get("selected_strategy_fingerprint", {}) or {}
+    if not isinstance(fingerprint, dict):
+        return "OPTUNA_NOT_APPLICABLE"
+    if fingerprint.get("target_component") != "optimizer/lr-schedule":
+        return "OPTUNA_NOT_APPLICABLE"
+    return get_optuna_block(
+        config.OPTUNA_N_TRIALS,
+        config.OPTUNA_TIMEOUT_SECONDS,
+        config.OPTUNA_SEARCH_EPOCHS,
+    )
+
+
+_inject_optuna_block_tool = FunctionTool(func=inject_optuna_block_fn)
 
 # ---------------------------------------------------------------------------
 # Refinement plan FunctionTool
@@ -355,6 +387,18 @@ make optimizer and learning-rate schedule a first-class, isolated refinement:
 - A fixed-LR script is invalid for this target. The Fix #1 scheduler validator
   will hard-reject variants without a real PyTorch scheduler and correct
   scheduler.step() call.
+- **Bayesian optimization (Optuna)**: when target_component is
+  `optimizer/lr-schedule`, call `inject_optuna_block_fn` and splice the returned
+  block into the script VERBATIM, positioned AFTER `build_model`, `train_loader`,
+  `val_loader`, `pos_weight`, `device`, and the script's `model` are defined but
+  immediately BEFORE the main training loop. The block runs a seeded TPE study and
+  leaves `optimizer`, `scheduler`, and `best_params` in scope. If it returns
+  `OPTUNA_NOT_APPLICABLE` (or an empty/sentinel string), do not splice anything —
+  write the optimizer/scheduler yourself per the mechanism_class above. The main
+  training loop MUST consume the Optuna-built `optimizer` and `scheduler`, wrapped
+  so that `if best_params is None:` falls back to your LLM-written optimizer and
+  scheduler — this covers the case where Optuna completes fewer than
+  OPTUNA_MIN_TRIALS trials (timeout / failures) and sets `best_params = None`.
 
 small-data-safe strategy policy for the current grouped train split (~287 samples):
 prefer, in priority order: (1) freeze or partially-freeze the pretrained backbone
@@ -528,7 +572,7 @@ refinement_coder_agent = LlmAgent(
         "and outputs the complete refined script as state['current_script']."
     ),
     instruction=_INSTRUCTION,
-    tools=[_load_context_tool, _load_fusion_scripts_tool, _save_plan_tool, code_validator_tool, store_validation_cache_tool],
+    tools=[_load_context_tool, _load_fusion_scripts_tool, _inject_optuna_block_tool, _save_plan_tool, code_validator_tool, store_validation_cache_tool],
     output_key="current_script",
     include_contents="none",
     after_model_callback=count_tokens_callback,

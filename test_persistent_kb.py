@@ -1,6 +1,7 @@
 """Tests for the MLEvolve persistent AOI knowledge base (quadruple schema).
 
-Each KB record is now {plan, code_diff, metrics, tags}:
+Each KB record is now {plan, code_diff, metrics, tags, helpful_mechanisms,
+harmful_mechanisms}:
   - plan:      selected_refinement_strategy string
   - code_diff: TRUNCATED unified diff (prev best -> current); never a full script
   - metrics:   {ng_recall, miss_rate, overkill_rate, accuracy, improved}
@@ -91,13 +92,35 @@ class MakeCodeDiffTests(unittest.TestCase):
 
 
 class EvaluatorWritesQuadrupleTests(unittest.TestCase):
+    def test_helpful_mechanisms_read_mapping_like_state(self):
+        class StateLike:
+            def get(self, key, default=None):
+                if key == "diagnosis_brief":
+                    return {"recommended_target": "weighted_loss"}
+                return default
+
+        helpful = evaluator_agent._helpful_mechanisms_from_state(
+            StateLike(),
+            improved=True,
+            selected_fingerprint={
+                "target_component": "weighted_loss",
+                "mechanism_class": "focal_loss",
+            },
+            code_diff="+loss change",
+        )
+
+        self.assertEqual(helpful, ["weighted_loss:focal_loss"])
+
     def test_new_record_has_plan_diff_metrics_and_failure_mode_tag(self):
         # A clean, parseable METRICS line so the full run yields real metrics.
         # overkill = fp / (fp + tn) = 9 / 30 = 0.30 (> 0.12), so the multiseed
         # confirmation path is not triggered and run_script is called twice.
-        stdout = 'METRICS: {"tp": 27, "tn": 21, "fp": 9, "fn": 4, "threshold": 0.2, "avg_latency_ms": 1}'
+        stdout = (
+            'METRICS: {"tp": 27, "tn": 21, "fp": 9, "fn": 4, "threshold": 0.2, '
+            '"avg_latency_ms": 1, "prob_gap": 0.4, "roc_auc": 0.8}'
+        )
         run_result = mock.Mock(
-            returncode=0, timed_out=False, duration_ms=12.0, stdout=stdout, stderr=""
+            returncode=0, timed_out=False, duration_ms=60000.0, stdout=stdout, stderr=""
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -151,7 +174,8 @@ class EvaluatorWritesQuadrupleTests(unittest.TestCase):
                 self.assertEqual(
                     set(record.keys()),
                     {"plan", "code_diff", "metrics", "tags",
-                     "target_component", "mechanism_class"},
+                     "target_component", "mechanism_class",
+                     "helpful_mechanisms", "harmful_mechanisms"},
                 )
                 # plan
                 self.assertEqual(record["plan"], "focal_loss: down-weight easy negatives")
@@ -170,6 +194,108 @@ class EvaluatorWritesQuadrupleTests(unittest.TestCase):
                 self.assertTrue(
                     ("improved" in record["tags"]) or ("regressed" in record["tags"])
                 )
+                self.assertEqual(record["harmful_mechanisms"], [])
+                self.assertEqual(record["helpful_mechanisms"], [])
+
+    def test_new_record_tracks_helpful_and_harmful_mechanisms(self):
+        stdout = (
+            'METRICS: {"tp": 27, "tn": 21, "fp": 9, "fn": 4, "threshold": 0.2, '
+            '"avg_latency_ms": 1, "prob_gap": 0.4, "roc_auc": 0.8}'
+        )
+        run_result = mock.Mock(
+            returncode=0, timed_out=False, duration_ms=60000.0, stdout=stdout, stderr=""
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_dir = Path(tmp)
+            kb_path = checkpoint_dir / "persistent_aoi_kb.json"
+            with (
+                mock.patch.object(config, "CHECKPOINT_DIR", checkpoint_dir),
+                mock.patch.object(
+                    config, "CKPT_TRIED_APPROACHES", checkpoint_dir / "tried_approaches.json"
+                ),
+                mock.patch.object(
+                    config, "CKPT_BEST_PIPELINE", checkpoint_dir / "best_pipeline.json"
+                ),
+                mock.patch.object(config, "CKPT_PERSISTENT_KB", kb_path),
+                mock.patch.object(
+                    evaluator_agent.code_runner, "run_script", return_value=run_result
+                ),
+            ):
+                eval_ctx = FakeContext({
+                    "best_pipeline_script": "print('OLD pipeline')\n",
+                    "current_script": "print('NEW candidate pipeline')\n",
+                    "outer_iteration": 2,
+                    "inner_iteration": 3,
+                    "current_best_score": 0.0,
+                    "best_overkill_rate": 1.0,
+                    "best_miss_rate": 1.0,
+                    "best_accuracy": 0.0,
+                    "best_f1": 0.0,
+                    "no_improve_count": 0,
+                    "token_count": 0,
+                    "selected_refinement_strategy": "focal_loss: down-weight easy negatives",
+                    "selected_strategy_fingerprint": {
+                        "target_component": "weighted_loss",
+                        "mechanism_class": "focal_loss",
+                    },
+                    "refinement_plan": {
+                        "target_component": "weighted_loss",
+                        "changes_summary": "swap BCE for focal loss",
+                    },
+                    "diagnosis_brief": {
+                        "failure_classification": {"failure_mode": "g_ng_overlap"},
+                        "recommended_target": "weighted_loss",
+                    },
+                    "tried_approaches": [
+                        {
+                            "outer": 1,
+                            "inner": 9,
+                            "strategy_fingerprint": {
+                                "target_component": "calibration",
+                                "mechanism_class": "temperature_scaling",
+                            },
+                            "result": {"improved": False},
+                            "failure_reason": "no_improvement",
+                        },
+                        {
+                            "outer": 2,
+                            "inner": 0,
+                            "strategy_fingerprint": {
+                                "target_component": "stereo_fusion",
+                                "mechanism_class": "attention_gate",
+                            },
+                            "result": {"improved": False},
+                            "failure_reason": "no_improvement",
+                        },
+                        {
+                            "outer": 2,
+                            "inner": 1,
+                            "strategy_fingerprint": {
+                                "target_component": "model_architecture",
+                                "mechanism_class": "wider_backbone",
+                            },
+                            "result": {"improved": True},
+                            "failure_reason": "accepted",
+                        },
+                        {
+                            "outer": 2,
+                            "inner": 2,
+                            "strategy_fingerprint": {
+                                "target_component": "weighted_loss",
+                                "mechanism_class": "class_weighting",
+                            },
+                            "result": {"improved": False},
+                            "failure_reason": "no_improvement",
+                        },
+                    ],
+                })
+                evaluator_agent.evaluate_and_update_fn(eval_ctx)
+
+                records = json.loads(kb_path.read_text(encoding="utf-8"))
+                record = records[0]
+                self.assertEqual(record["helpful_mechanisms"], ["weighted_loss:focal_loss"])
+                self.assertEqual(record["harmful_mechanisms"], ["weighted_loss:class_weighting"])
 
 
 class PlannerSummaryTests(unittest.TestCase):
@@ -241,6 +367,33 @@ class PlannerSummaryTests(unittest.TestCase):
         self.assertIn("new overlap plan", summary)
         self.assertNotIn("threshold plan", summary.split("MATCHED_RECORDS", 1)[-1])
         self.assertNotIn("x" * 200, summary)
+
+    def test_prompt_view_includes_mechanism_summary_when_present(self):
+        view = planner_agent._kb_record_prompt_view({
+            "plan": "focal loss",
+            "code_diff": "+loss",
+            "metrics": {"ng_recall": 0.7},
+            "tags": ["g_ng_overlap", "improved"],
+            "helpful_mechanisms": ["weighted_loss:focal_loss"],
+            "harmful_mechanisms": [
+                "stereo_fusion:attention_gate",
+                "weighted_loss:class_weighting",
+            ],
+        })
+
+        self.assertEqual(
+            view["mechanisms"],
+            "Helped: weighted_loss:focal_loss | Hurt: stereo_fusion:attention_gate, weighted_loss:class_weighting",
+        )
+
+    def test_prompt_view_omits_mechanism_summary_for_legacy_records(self):
+        view = planner_agent._kb_record_prompt_view({
+            "plan": "legacy",
+            "metrics": {"ng_recall": 0.5},
+            "label": "failure",
+        })
+
+        self.assertNotIn("mechanisms", view)
 
     def test_summary_renders_mixed_legacy_and_new_records(self):
         # Legacy record: old {plan, code_snippet, metrics, label} shape.

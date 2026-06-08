@@ -88,6 +88,8 @@ REFINEMENT_POPULATION_MAX = 5  # keep a small Pareto-style archive for non-linea
 ERROR_ANALYSIS_SAMPLE_CAP = 20  # max FP/FN samples surfaced into an LLM prompt (full set stays on disk)
 VALIDATION_CACHE_MAX = 50       # cap on the in-state {sha256: status} validation cache
 TRIED_APPROACHES_RECENT_K = 8   # full recent tried_approaches entries shown in the planner prompt (rest aggregated)
+REFLEXION_ENABLED = True
+REFLEXION_MAX_HISTORY = 30
 PROBE_OVERKILL_REJECT_MAX = 0.90  # reject only catastrophic probes (ConvNeXt-style ≥90% overkill)
 PROBE_NG_RECALL_REJECT_MIN = 0.80  # reject probes with severe NG recall collapse
 PROBE_PROBABILITY_GAP_MIN = 0.01  # only block truly flat models (gap≈0); let borderline cases train
@@ -139,9 +141,14 @@ DEBUG_CHECK_TIMEOUT_SECONDS = 120  # cap for debug_mode smoke runs (max_epochs=1
 DEBUGGER_RETRY_CAP = 3
 
 # Token budget
-TOKEN_BUDGET = 10_000_000
+TOKEN_BUDGET = 25_000_000
 LITE_ABLATION_MODE = True
-TOKEN_LITE_THRESHOLD = 7_000_000  # Switch to flash model once tokens exceed this (must be < TOKEN_BUDGET)
+# Factorialized ablation (Phase 2): run a 2^K factorial grid over core pipeline
+# components on the first outer iteration, then a targeted/capped subset thereafter.
+ABLATION_FACTORIAL_ENABLED = True
+ABLATION_FACTORIAL_K = 4
+LITE_ABLATION_FACTORIAL_CAP = 8
+TOKEN_LITE_THRESHOLD = 20_000_000  # Switch to flash model once tokens exceed this (must be < TOKEN_BUDGET)
 # P0: Miss Rate  P1: NG Recall  P2: Overkill Rate  P4: Accuracy
 OVERKILL_RELAXED_MAX  = 0.08   # §9.1 relaxed minimum
 OVERKILL_FINAL_MAX    = 0.05   # §9.2 final target
@@ -151,6 +158,19 @@ MISS_RATE_RELAXED_MAX = 0.03   # §9.1 relaxed minimum (P0 — highest priority)
 MISS_RATE_FINAL_MAX   = 0.00   # §9.2 final target
 ACCURACY_RELAXED_MIN  = 0.92   # §9.1 relaxed minimum
 ACCURACY_FINAL_MIN    = 0.97   # §9.2 final target
+
+# Optuna Bayesian optimization (Phase 2 optimizer/lr-schedule refinement)
+# When the selected strategy targets `optimizer/lr-schedule`, the refinement
+# coder splices a TPE search block (shared/optuna_template.py) before the main
+# training loop. The study runs OPTUNA_N_TRIALS short trials (OPTUNA_SEARCH_EPOCHS
+# epochs each, capped by OPTUNA_TIMEOUT_SECONDS wall-clock). The best params are
+# only adopted when at least OPTUNA_MIN_TRIALS trials complete; otherwise the
+# script falls back to the LLM-written optimizer/scheduler (best_params = None).
+OPTUNA_ENABLED = True
+OPTUNA_N_TRIALS = 12
+OPTUNA_TIMEOUT_SECONDS = 600
+OPTUNA_SEARCH_EPOCHS = 5
+OPTUNA_MIN_TRIALS = 5
 
 # Threshold sweep
 THRESHOLD_MIN = 0.10
@@ -175,6 +195,7 @@ CKPT_SUBMISSION_ATTEMPTS = CHECKPOINT_DIR / "submission_attempts.json"
 CKPT_TRIED_APPROACHES = CHECKPOINT_DIR / "tried_approaches.json"
 CKPT_TRIED_ENSEMBLE_APPROACHES = CHECKPOINT_DIR / "tried_ensemble_approaches.json"
 CKPT_PERSISTENT_KB = CHECKPOINT_DIR / "persistent_aoi_kb.json"
+CKPT_FAILED_ARCHITECTURES = CHECKPOINT_DIR / "failed_architectures.json"
 
 
 def ckpt_ablation(n: int) -> Path:

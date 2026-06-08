@@ -1,12 +1,20 @@
+import logging
+
 from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.tools import FunctionTool
 
 from mle_star_agent import config
 from mle_star_agent.phases.phase1_init.baseline_coder_agent import baseline_coder_agent
-from mle_star_agent.phases.phase1_init.candidate_evaluator_agent import candidate_evaluator_agent
+from mle_star_agent.phases.phase1_init.candidate_evaluator_agent import (
+    _PHASE1_FAILURE_STATUSES,
+    _fa_key,
+    candidate_evaluator_agent,
+)
 from mle_star_agent.phases.phase1_init.merger_agent import merger_agent
 from mle_star_agent.phases.phase1_init.retriever_agent import retriever_agent
-from mle_star_agent.shared.checkpoint_io import checkpoint_exists, load_checkpoint
+from mle_star_agent.shared.checkpoint_io import checkpoint_exists, load_checkpoint, save_checkpoint
+
+logger = logging.getLogger(__name__)
 
 
 def check_phase1_done_fn(tool_context) -> str:
@@ -29,6 +37,35 @@ def check_phase1_done_fn(tool_context) -> str:
         tool_context.state["best_accuracy"] = l0.get("L0_accuracy", 0.0)
         tool_context.state["best_f1"] = l0.get("L0_f1", 0.0)
         tool_context.state["best_candidate_name"] = l0.get("best_candidate_name", "")
+        # Restore Phase 1 failed architectures so Phase 2 planner can hard-ban them.
+        # If failed_architectures.json is missing (e.g. crash before it was written),
+        # reconstruct the ban list from candidate_scores.json and persist it now.
+        if checkpoint_exists(config.CKPT_FAILED_ARCHITECTURES):
+            try:
+                fa_data = load_checkpoint(config.CKPT_FAILED_ARCHITECTURES)
+                tool_context.state["phase1_failed_architectures"] = fa_data.get("failed", [])
+            except Exception:
+                logger.warning("failed_architectures.json is unreadable — will reconstruct from candidate_scores.json.")
+                tool_context.state["phase1_failed_architectures"] = []
+        else:
+            # Crash-recovery: rebuild from candidate_scores.json.
+            try:
+                scores_data = load_checkpoint(config.CKPT_CANDIDATE_SCORES)
+                failed = [
+                    {"name": (s.get("name") or "").strip(), "architecture": (s.get("architecture") or "").strip()}
+                    for s in scores_data.get("scores", [])
+                    if s.get("status") in _PHASE1_FAILURE_STATUSES
+                    and ((s.get("name") or "").strip() or (s.get("architecture") or "").strip())
+                ]
+                merged = {_fa_key(e): e for e in failed if _fa_key(e)}
+                all_failed = list(merged.values())
+                tool_context.state["phase1_failed_architectures"] = all_failed
+                if all_failed:
+                    save_checkpoint(config.CKPT_FAILED_ARCHITECTURES, {"failed": all_failed})
+                    logger.info("Reconstructed and persisted %d failed arch(s) from candidate_scores.json.", len(all_failed))
+            except Exception:
+                logger.warning("Could not reconstruct failed_architectures from candidate_scores.json.")
+                tool_context.state["phase1_failed_architectures"] = []
         tool_context.actions.escalate = True
         return (
             f"PHASE1_DONE: candidate_scores.json and L0.json already exist — "

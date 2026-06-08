@@ -1,5 +1,20 @@
 import logging
+import re
 import time
+
+# Statuses that represent a genuine Phase 1 failure worth banning permanently.
+# smoke_deferred = ranked out but not broken — do NOT ban.
+_PHASE1_FAILURE_STATUSES = {"failed", "smoke_pruned"}
+
+
+def _norm_arch(s: str) -> str:
+    """Lowercase + strip all non-alphanumeric. Used as dedup/match key for arch names."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _fa_key(entry: dict) -> str:
+    """Composite dedup key: prefer name, fall back to architecture."""
+    return _norm_arch(entry.get("name") or "") or _norm_arch(entry.get("architecture") or "")
 
 from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.tools import FunctionTool
@@ -387,6 +402,38 @@ def consolidate_candidate_scores_fn(tool_context) -> str:
     tool_context.state["candidate_scores"] = scores
     config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     save_checkpoint(config.CKPT_CANDIDATE_SCORES, {"scores": scores})
+
+    # Persist failed architecture names so Phase 2 planner and the retriever (on
+    # clean restart) can hard-exclude them and never re-run a known-failed backbone.
+    # Bug fixes: (1) only ban genuine failures — smoke_deferred means ranked-out,
+    # not broken; (2) key by normalized name OR architecture so name-empty entries
+    # are not dropped; (3) always merge with existing file so prior-run bans survive
+    # even when the current run has zero new failures.
+    new_failures = []
+    for s in scores:
+        if s.get("status") in _PHASE1_FAILURE_STATUSES:
+            name = (s.get("name") or "").strip()
+            arch = (s.get("architecture") or "").strip()
+            if name or arch:
+                new_failures.append({"name": name, "architecture": arch})
+
+    existing_fa: dict = {}
+    if checkpoint_exists(config.CKPT_FAILED_ARCHITECTURES):
+        try:
+            existing_fa = load_checkpoint(config.CKPT_FAILED_ARCHITECTURES)
+        except Exception:
+            logger.warning("failed_architectures.json is unreadable — treating as empty.")
+
+    merged = {_fa_key(e): e for e in existing_fa.get("failed", []) if _fa_key(e)}
+    for e in new_failures:
+        k = _fa_key(e)
+        if k:
+            merged[k] = e
+
+    all_failed = list(merged.values())
+    if all_failed:
+        save_checkpoint(config.CKPT_FAILED_ARCHITECTURES, {"failed": all_failed})
+    tool_context.state["phase1_failed_architectures"] = all_failed
 
     successful = sum(1 for s in scores if s.get("status") == "success")
 

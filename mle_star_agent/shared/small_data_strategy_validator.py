@@ -17,7 +17,9 @@ KNOWN_FAILED_STRATEGY_FINGERPRINTS = {
     ("calibration", "threshold_only"),
     ("stereo_fusion", "global_feature_difference_only"),
     ("stereo_fusion", "two_independent_backbone_stereo"),
-    ("model_architecture", "larger_backbone"),
+    # NOTE: ("model_architecture", "larger_backbone") was removed — this ban was derived
+    # from the broken single-lot split (train=lot4103 only). On the correct cross-lot split
+    # DINOv2-ViT and ResNet-50 are valid and recommended candidates.
     # MG11: any geometric augmentation on the ROI crop collapses prob_gap
     # (v3_roi_centered_aug: val prob_gap 0.058 < 0.10 over-aug signature).
     ("augmentation", "roi_geometric_augmentation"),
@@ -248,9 +250,11 @@ def validate_small_data_strategy_source(script: str, input_modality: str = "ster
     global_feature_difference_only = (
         _has_global_feature_difference_only(tree, strings) if is_stereo else False
     )
+    # has_large_backbone removed from known_failed: DINOv2/ViT/ResNet-50 are
+    # valid on the corrected cross-lot split. Large backbone without regularization
+    # is still caught below via large_capacity_without_regularization.
     known_failed = (
         global_feature_difference_only
-        or has_large_backbone
         or independent_backbones
     )
 

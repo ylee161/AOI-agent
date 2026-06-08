@@ -30,6 +30,47 @@ from mle_star_agent.phases.phase2_refinement.ideator_agent import seek_help_tool
 
 logger = logging.getLogger(__name__)
 
+
+def _norm_arch(s: str) -> str:
+    """Lowercase + strip all non-alphanumeric. Shared normalizer for arch dedup/matching."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _load_phase1_failed(tool_context) -> list:
+    """Return the list of Phase 1 failed architecture entries, from state or checkpoint."""
+    entries = tool_context.state.get("phase1_failed_architectures") or []
+    if not entries and checkpoint_exists(config.CKPT_FAILED_ARCHITECTURES):
+        try:
+            entries = load_checkpoint(config.CKPT_FAILED_ARCHITECTURES).get("failed", [])
+        except Exception:
+            logger.warning("failed_architectures.json is unreadable — ban list empty.")
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def _banned_arch_in_strategy(strategy_text: str, failed_entries: list) -> str | None:
+    """Return the first banned arch name found in strategy_text, or None.
+
+    Checks both fields (name AND architecture) from each entry.
+    Uses word-boundary match on the raw lowercase text first; falls back to a
+    normalized substring match (handles hyphens/underscores/spaces) for terms
+    >= 4 chars after normalization, to avoid false positives from short tokens.
+    """
+    text_lower = strategy_text.lower()
+    text_norm = _norm_arch(strategy_text)
+    for e in failed_entries:
+        for field in ("name", "architecture"):
+            val = (e.get(field) or "").strip()
+            if not val:
+                continue
+            val_lower = val.lower()
+            if re.search(r"\b" + re.escape(val_lower) + r"\b", text_lower):
+                return val
+            val_norm = _norm_arch(val)
+            if len(val_norm) >= 4 and val_norm in text_norm:
+                return val
+    return None
+
+
 OPTIMIZER_LR_SCHEDULE_TARGET = "optimizer/lr-schedule"
 _TARGET_COMPONENT_ALIASES = {
     "optimizer_lr_schedule": OPTIMIZER_LR_SCHEDULE_TARGET,
@@ -473,6 +514,8 @@ def load_tried_approaches_fn(tool_context) -> str:
 
     kb_summary = _persistent_kb_summary(failure_mode=_current_failure_mode(tool_context.state))
     kb_block = f"\n\n{kb_summary}" if kb_summary else ""
+    reflexion_memo = str(tool_context.state.get("reflexion_memo_text") or "").strip()
+    reflexion_block = f"\n\nREFLEXION_MEMO:\n{reflexion_memo}" if reflexion_memo else ""
     return (
         f"{analytical_state_line(tool_context.state)}\n\n"
         f"{modality_block}\n\n"
@@ -480,6 +523,7 @@ def load_tried_approaches_fn(tool_context) -> str:
         f"{_tried_approaches_view(tried)}\n\n"
         f"{_context_reports_block(tool_context.state)}"
         f"{kb_block}"
+        f"{reflexion_block}"
     )
 
 
@@ -597,6 +641,34 @@ def _context_reports_block(state: dict) -> str:
                 "last seek_help call — advisory only; any derived strategy still "
                 "passes the failed-fingerprint gate): "
                 f"{json.dumps(hint_strs, default=str)}"
+            )
+
+    # Hard ban: architectures that failed (crashed, timed out, or were pruned) in
+    # Phase 1. The planner MUST NOT propose swapping to any of these backbones.
+    phase1_failed = state.get("phase1_failed_architectures") or []
+    if not phase1_failed and checkpoint_exists(config.CKPT_FAILED_ARCHITECTURES):
+        try:
+            fa_data = load_checkpoint(config.CKPT_FAILED_ARCHITECTURES)
+            phase1_failed = fa_data.get("failed", [])
+        except Exception:
+            logger.warning("failed_architectures.json is unreadable — ban list empty.")
+    if isinstance(phase1_failed, list) and phase1_failed:
+        # Emit both name and architecture for each entry so the LLM sees all aliases.
+        failed_labels = []
+        seen_norms: set[str] = set()
+        for e in phase1_failed:
+            if not isinstance(e, dict):
+                continue
+            for field in ("name", "architecture"):
+                val = (e.get(field) or "").strip()
+                if val and _norm_arch(val) not in seen_norms:
+                    seen_norms.add(_norm_arch(val))
+                    failed_labels.append(val)
+        if failed_labels:
+            parts.append(
+                "PHASE1_FAILED_ARCHITECTURES (HARD BAN — do NOT propose any of these "
+                "as a swap_backbone or model_architecture target; they crashed, timed "
+                f"out, or were pruned in Phase 1): {json.dumps(failed_labels, default=str)}"
             )
 
     return "\n".join(parts)
@@ -823,6 +895,20 @@ def save_strategy_candidates_fn(
             "state['target_rotation_override']=True only when threshold-curve and "
             "error-analysis evidence uniquely justify staying on this target."
         )
+
+    # Hard-ban: if the chosen strategy description mentions an architecture that
+    # already crashed/timed-out/was-pruned in Phase 1, reject it immediately.
+    # Uses word-boundary + normalized-substring matching to catch alias variants
+    # (hyphens vs underscores vs spaces) without short-token false positives.
+    phase1_failed = _load_phase1_failed(tool_context)
+    if phase1_failed:
+        banned = _banned_arch_in_strategy(chosen_strategy, phase1_failed)
+        if banned:
+            return (
+                f"PHASE1_FAILED_ARCHITECTURE_REJECTED: chosen strategy mentions "
+                f"'{banned}' which already failed in Phase 1 (crashed, timed out, "
+                "or pruned). Pick a different backbone."
+            )
 
     failed_keys = _failed_strategy_fingerprint_keys(tried_approaches)
     input_modality = tool_context.state.get("input_modality", "stereo")
@@ -1064,6 +1150,20 @@ def ensure_selected_strategy_fn(tool_context) -> str:
         reason = "Planner did not persist a selected strategy; using diagnosis fallback."
         mechanism = "fallback"
 
+    # Apply the same Phase 1 arch ban to the fallback strategy — the fallback
+    # is derived from diagnosis text which can name specific architectures.
+    phase1_failed = _load_phase1_failed(tool_context)
+    if phase1_failed:
+        banned = _banned_arch_in_strategy(fallback, phase1_failed)
+        if banned:
+            fallback = (
+                f"augmentation_regularization_fallback: apply MixUp + weight decay "
+                "to reduce overfitting — backbone-neutral alternative chosen because "
+                f"'{banned}' is a Phase 1 banned architecture."
+            )
+            reason += f" (original fallback mentioned banned arch '{banned}'; replaced.)"
+            logger.warning("Strategy gate fallback mentioned banned arch '%s'; substituted.", banned)
+
     tool_context.state["refinement_strategy_candidates"] = {"fallback": fallback}
     tool_context.state["refinement_strategy_fingerprints"] = {
         "fallback": _normalise_strategy_fingerprint(target, mechanism)
@@ -1121,6 +1221,8 @@ From the `load_tried_approaches_fn` output (STEP 1), use:
   `seek_help_fn` call (the seek_help tool), if present. Treat them as advisory
   only; any derived strategy still goes through the same KNOWN_FAILED /
   strategy_gate dedup path.
+- REFLEXION_MEMO — read this block when present and avoid repeating any flagged
+  mechanism_class strings.
 - TRIED_APPROACHES_RECENT — the last few prior attempts in full (from the load
     tool output). Each entry has: outer, inner, target_component, changes_summary,
     strategy_fingerprint, result.ng_recall, result.overkill,
@@ -1169,7 +1271,7 @@ Known failed strategy fingerprints are banned before candidate selection:
 - (`calibration`, `threshold_only`) — Calibration/threshold curves are REPORTING, not the only fix.
 - (`stereo_fusion`, `global_feature_difference_only`) — mg8 global feature-difference-only hurt.
 - (`stereo_fusion`, `two_independent_backbone_stereo`) — two-independent-backbone stereo adds capacity and overfits.
-- (`model_architecture`, `larger_backbone`) — larger backbone is the wrong lever for ~287 train samples.
+- (`model_architecture`, `larger_backbone`) — REMOVED: this ban was based on the broken single-lot split. On the corrected cross-lot split, DINOv2-ViT-S/14 and ResNet-50 with layerwise LR are RECOMMENDED next steps (see KB records for dinov2_full_finetune and efficientnet_b1_layerwise_lr).
 - (`augmentation`, `roi_geometric_augmentation`) — DEAD END (MG11). Every form of
   geometric augmentation applied to the ROI crop collapses prob_gap below 0.10
   (v3_roi_centered_aug: val prob_gap 0.058). The signal is too weak to survive

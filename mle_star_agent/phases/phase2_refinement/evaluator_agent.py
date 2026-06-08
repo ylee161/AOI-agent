@@ -1621,6 +1621,8 @@ def evaluate_and_update_fn(tool_context) -> str:
         tool_context.state["no_improve_count"] = 0
         tool_context.state["force_fresh_ablation"] = True
         _clear_ablation_state(tool_context.state)
+        tool_context.state.pop("reflexion_memo_text", None)
+        tool_context.state.pop("reflexion_memo", None)
         # Dynamic ideation injection (Fix #1): the idea pool has gone stale — the
         # inner loop stalled below relaxed acceptance. Pull fresh, failure-mode-keyed
         # technique hints from arXiv into state["retrieved_technique_hints"] BEFORE

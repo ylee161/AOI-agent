@@ -247,14 +247,35 @@ def web_search(query: str) -> str:
 # State / checkpoint helpers
 # ---------------------------------------------------------------------------
 
+def _load_runtime_failed_arch_terms() -> list[str]:
+    """Return lowercase name/architecture tokens from the failed_architectures checkpoint."""
+    if not checkpoint_exists(config.CKPT_FAILED_ARCHITECTURES):
+        return []
+    try:
+        data = load_checkpoint(config.CKPT_FAILED_ARCHITECTURES)
+        terms = []
+        for e in data.get("failed", []):
+            for key in ("name", "architecture"):
+                val = (e.get(key) or "").strip().lower()
+                if val:
+                    terms.append(val)
+        return terms
+    except Exception:
+        return []
+
+
 def check_retriever_needed_fn(tool_context) -> str:
     """Skip retrieval if candidate scripts are already generated (resume support)."""
     if tool_context.state.get("retrieved_candidates"):
         return "ALREADY_RETRIEVED: state['retrieved_candidates'] is populated — skip searching."
+
+    # Build combined exclusion list: static hard-excludes + runtime failures from prior runs.
+    runtime_failed = _load_runtime_failed_arch_terms()
+    excluded_terms = [t.lower() for t in config.HARD_EXCLUDED_ARCHITECTURES] + runtime_failed
+
     if checkpoint_exists(config.CKPT_CANDIDATE_SCRIPTS):
         data = load_checkpoint(config.CKPT_CANDIDATE_SCRIPTS)
         scripts = data.get("scripts", [])
-        excluded_terms = [t.lower() for t in config.HARD_EXCLUDED_ARCHITECTURES]
         valid = [
             s for s in scripts
             if not any(t in (s.get("name", "") + " " + s.get("architecture", "")).lower()
@@ -268,10 +289,19 @@ def check_retriever_needed_fn(tool_context) -> str:
         skipped = len(scripts) - len(valid)
         return (
             f"RETRIEVAL_NEEDED: only {len(valid)}/3 valid scripts in checkpoint "
-            f"({skipped} hard-excluded failed model(s) filtered out). "
-            "Proceed with web searches to find replacement architectures."
+            f"({skipped} hard-excluded or previously-failed model(s) filtered out). "
+            "Proceed with web searches to find replacement architectures. "
+            + (f"RUNTIME_FAILED_ARCHITECTURES (hard ban — do NOT retrieve these again): "
+               f"{runtime_failed}" if runtime_failed else "")
         )
-    return "RETRIEVAL_NEEDED: proceed with data-split check, then 4 web searches."
+
+    base_msg = "RETRIEVAL_NEEDED: proceed with data-split check, then 4 web searches."
+    if runtime_failed:
+        base_msg += (
+            f" RUNTIME_FAILED_ARCHITECTURES (hard ban from prior runs — do NOT retrieve "
+            f"these again): {runtime_failed}"
+        )
+    return base_msg
 
 
 def store_retrieved_candidates(tool_context, candidates_json: str) -> str:
@@ -433,6 +463,8 @@ empirically proven to fail the pre-training probe on this dataset every time:
   low probability for all samples, recall collapses to 0. Root cause: the patch embedding is a
   linear projection (not a conv), so the /3-repeat initialization cannot be applied cleanly;
   the model produces no signal even after probe epochs.
+- Any architecture listed in RUNTIME_FAILED_ARCHITECTURES in the STEP 0 response — those failed
+  at runtime in a prior session (crashed, timed out, or smoke-pruned) and must not be re-tried.
 Good replacement options: EfficientNet-B1/B2/B3 (same family as B0, more capacity),
 MobileNetV3-Large (lightweight, robust on small datasets), ResNet-50 with partial unfreeze,
 or a FROZEN DINOv2/CLIP/SigLIP feature extractor (these work as frozen backbones with no
