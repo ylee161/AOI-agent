@@ -26,16 +26,6 @@ ABLATION_FACTORS = [
         ),
     },
     {
-        "name": "weighted_loss",
-        "on_description": (
-            "Weighted loss ON: use the class-weighted cross-entropy loss."
-        ),
-        "off_description": (
-            "Remove weighted loss: replace the class-weighted cross-entropy loss "
-            "with a standard unweighted cross-entropy loss."
-        ),
-    },
-    {
         "name": "threshold_sweep",
         "on_description": (
             "Threshold sweep ON: select the classification threshold by sweeping the "

@@ -152,7 +152,6 @@ TARGETED_ABLATION_VARIANTS = {
     "low_capacity_miss": {
         ("stereo_fusion", 0),
         "optimizer_lr_schedule",
-        ("weighted_loss", 0),
     },
     "near_acceptance": {
         "threshold_acceptance_distance",
@@ -181,6 +180,14 @@ def _variant_matches_target(variant: dict, target_names: set) -> bool:
 
 
 def _is_complete_ablation_results(results: list) -> bool:
+    # Slot-completeness check: every variant index must have produced a result.
+    # The per-variant runner writes status "success"/"failed" (line ~524) and the
+    # skip paths write "skipped"; it never writes "done". Counting "success" here
+    # is required — without it an all-successful iteration-0 grid is judged
+    # incomplete and its aggregate checkpoint is never saved. "skipped" counts too,
+    # because mono (stereo-off) and targeted later iterations legitimately skip
+    # variants to fill their slot. (The zero-evidence guard for diagnosis lives in
+    # the diagnosis checkpoint gate + empty-ranking scorer, not here.)
     expected = set(range(NUM_ABLATION_VARIANTS))
     seen = {
         int(r.get("variant_index"))
@@ -188,7 +195,7 @@ def _is_complete_ablation_results(results: list) -> bool:
         if (
             isinstance(r, dict)
             and r.get("variant_index") is not None
-            and r.get("status") in ("done", "skipped", "failed")
+            and r.get("status") in ("success", "skipped", "failed")
         )
     }
     return seen == expected

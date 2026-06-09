@@ -48,6 +48,32 @@ BOARD_CODE_PATTERN = r"VHB[A-Z0-9]+"
 # Set to 0 to disable stripping.
 BOARD_CODE_STRIP_SUFFIX_DIGITS = 0
 
+# ─── Typed training hooks (dataset-capability gating) ────────────────────────
+# The generated candidate script's architecture block is composed from *typed
+# switches* (see shared/script_template.py) instead of being free-written. Two
+# of those switches are AOI-specific and only activate when the dataset supports
+# them, so the pipeline stays clean and reusable for any dataset.
+#
+# Capability descriptor — what THIS dataset can support:
+#   DATASET_HAS_STEREO_VIEWS: True when each sample has a stereo image pair
+#     (img_l + img_r). When False, VIEW_FUSION_MODE is not offered and the
+#     template falls back to a single-image model. For the bundled SUP046 AOI
+#     data this is True; a single-image dataset would set it False.
+#   DATASET_GROUP_COLUMN: name of the per-sample group key used for group-robust
+#     training/selection (the board grouping above), or None to disable group
+#     robustness and fall back to plain validation selection.
+DATASET_HAS_STEREO_VIEWS = True
+DATASET_GROUP_COLUMN = "board"
+
+# Default switch positions. LOSS_MODE (bce|focal|logit_adjust) and OPTIMIZER_MODE
+# (adamw|sgd|adam) are universal. VIEW_FUSION_MODE (concat_diff|siamese_feature_diff)
+# and GROUP_ROBUST_MODE (group_dro|group_balanced|off) are honoured only when the
+# capability flags above are on; otherwise they resolve to single-image / off.
+DEFAULT_LOSS_MODE = "bce"
+DEFAULT_OPTIMIZER_MODE = "adamw"
+DEFAULT_VIEW_FUSION_MODE = "concat_diff"
+DEFAULT_GROUP_ROBUST_MODE = "off"
+
 # Models
 # num_retries is forwarded to litellm.acompletion (ADK's LiteLlm passes through
 # **kwargs), which retries transient 429/503/timeout errors with exponential
@@ -146,7 +172,7 @@ LITE_ABLATION_MODE = True
 # Factorialized ablation (Phase 2): run a 2^K factorial grid over core pipeline
 # components on the first outer iteration, then a targeted/capped subset thereafter.
 ABLATION_FACTORIAL_ENABLED = True
-ABLATION_FACTORIAL_K = 4
+ABLATION_FACTORIAL_K = 3
 LITE_ABLATION_FACTORIAL_CAP = 8
 TOKEN_LITE_THRESHOLD = 20_000_000  # Switch to flash model once tokens exceed this (must be < TOKEN_BUDGET)
 # P0: Miss Rate  P1: NG Recall  P2: Overkill Rate  P4: Accuracy
