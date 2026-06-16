@@ -6,6 +6,7 @@ from google.adk.tools import FunctionTool
 
 from mle_star_agent import config
 from mle_star_agent.shared.callbacks import (
+    _make_bypass_response,
     count_tokens_callback,
     log_context_size_callback,
     rate_limit_retry_callback,
@@ -84,6 +85,19 @@ def check_diagnosis_checkpoint_fn(tool_context) -> str:
 
 
 _check_ckpt_tool = FunctionTool(func=check_diagnosis_checkpoint_fn)
+
+
+def _bypass_diagnosis_ckpt(callback_context, llm_request):
+    """Skip agent entirely when a current diagnosis checkpoint exists."""
+    try:
+        result = check_diagnosis_checkpoint_fn(callback_context)
+        if result.startswith("CHECKPOINT_FOUND"):
+            return _make_bypass_response(result)
+        return None  # checkpoint absent or stale → LLM must run scorer + reason + write
+    except Exception as exc:
+        logger.warning("bypass_diagnosis_ckpt: exception — falling back to LLM: %s", exc)
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Write-report FunctionTool
@@ -269,9 +283,16 @@ Call `write_diagnosis_report_fn` with ALL five arguments:
    - `expected_miss_rate_max`
    - `failure_if`
 
-The prediction must be quantitative and realistic. Example:
-`{"expected_overkill_rate_max":0.25,"expected_ng_recall_min":0.93,
-"expected_miss_rate_max":0.07,"failure_if":"recall drops below 0.93 or overkill stays above 0.25"}`.
+ANCHOR the prediction to the CURRENT BEST metrics in the brief, not to the acceptance
+targets. One refinement step on this dataset typically moves a metric by 0.02-0.10;
+predicting near-target numbers (e.g. recall >= 0.93 when the best is 0.60) makes the
+contract fail every iteration and tells the planner nothing. Set:
+- `expected_ng_recall_min` ≈ current best ng_recall (a floor the change must not break),
+- `expected_miss_rate_max` ≈ current best miss_rate + 0.02,
+- `expected_overkill_rate_max` ≈ what the targeted change should plausibly reach.
+Example with best ng_recall=0.60, overkill=0.35:
+`{"expected_overkill_rate_max":0.30,"expected_ng_recall_min":0.58,
+"expected_miss_rate_max":0.44,"failure_if":"recall drops below 0.58 or overkill stays above 0.30"}`.
 
 ---
 ## STEP 5 — Summarise
@@ -288,7 +309,13 @@ After the tool call, provide a brief summary:
 
 diagnosis_agent = LlmAgent(
     name="diagnosis_agent",
-    model=config.MODEL_PRO,
+    # Flash (thinking disabled): the deterministic scorer (compute_diagnosis_scores_fn
+    # -> generate_diagnosis_brief) already computes all ablation deltas, the variant
+    # ranking, and the full failure-mode decision tree in Python. The LLM here only
+    # reads that pre-computed brief, verifies the recommended target, writes a few
+    # concrete bullets, and emits a quantitative prediction_contract — a read-and-route
+    # task that does not need the 16k MODEL_PRO thinking budget.
+    model=config.MODEL,
     description=(
         "Analyses ablation results to identify the most impactful pipeline component "
         "and writes state['diagnosis_report'] with a targeted refinement plan. "
@@ -297,7 +324,7 @@ diagnosis_agent = LlmAgent(
     instruction=_INSTRUCTION,
     tools=[_check_ckpt_tool, _compute_scores_tool, _write_report_tool],
     include_contents="none",
-    before_model_callback=log_context_size_callback,
+    before_model_callback=[_bypass_diagnosis_ckpt, log_context_size_callback],
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )

@@ -41,8 +41,10 @@ def test_broken_script_fails_fast_in_debug_mode():
 
 
 def test_debug_timeout_capped_at_config_value():
-    """debug_mode caps the effective timeout at DEBUG_CHECK_TIMEOUT_SECONDS."""
-    assert config.DEBUG_CHECK_TIMEOUT_SECONDS == 120
+    """debug_mode caps the effective timeout at DEBUG_CHECK_TIMEOUT_SECONDS.
+    240s covers a cold image-cache build + CPU fallback; pretrained-weight
+    downloads are handled by the separate AOI_PREFETCH_ONLY pass, not this cap."""
+    assert config.DEBUG_CHECK_TIMEOUT_SECONDS == 240
 
 
 def test_debug_patches_do_not_mutate_original_script():
@@ -56,6 +58,48 @@ def test_debug_patches_do_not_mutate_original_script():
     assert f"num_epochs = {cap}" in patched, "epoch value should be forced to the debug cap"
     assert "__aoi_cap5(train_ds)" in patched, "DataLoader arg should be capped"
     assert "num_epochs = 50" not in patched
+
+
+def test_inline_dataset_constructor_is_wrapped_whole():
+    """The template builds loaders as DataLoader(StereoDataset(samples, ...), ...).
+    The cap must wrap the whole constructor CALL — the old identifier-only regex
+    produced __aoi_cap5(StereoDataset)(...), wrapping the class, whose len()
+    raised inside the helper and silently skipped the 5% cap entirely."""
+    src = (
+        "train_loader = DataLoader(StereoDataset(train_samples, augment=True), "
+        "batch_size=BATCH_SIZE, shuffle=True, drop_last=True)\n"
+        "val_loader   = DataLoader(dataset=StereoDataset(val_samples, augment=False), "
+        "batch_size=BATCH_SIZE, shuffle=False)\n"
+    )
+    patched = code_runner.apply_debug_patches(src)
+    assert "__aoi_cap5(StereoDataset(train_samples, augment=True))" in patched
+    assert "dataset=__aoi_cap5(StereoDataset(val_samples, augment=False))" in patched
+    assert "__aoi_cap5(StereoDataset)" not in patched
+    compile(patched, "<patched>", "exec")
+
+
+def test_debug_cap_subset_is_strided_and_floored():
+    """The capped subset must spread across the (lot-ordered) dataset with a
+    floor of 16 samples, not take the first 5% (often single-class/lot)."""
+    script = """
+import torch.utils.data as tud
+from torch.utils.data import DataLoader
+
+class Toy(tud.Dataset):
+    def __len__(self):
+        return 200
+    def __getitem__(self, i):
+        return i
+
+loader = DataLoader(Toy(), batch_size=4)
+idx = [i for batch in loader for i in batch.tolist()]
+print("COUNT", len(idx), "SPREAD", max(idx) - min(idx))
+"""
+    result = code_runner.run_script(script, debug_mode=True)
+    assert result.returncode == 0, result.stderr
+    # 200 samples -> floor of 16 strided across the full range
+    assert "COUNT 16" in result.stdout
+    assert "SPREAD 180" in result.stdout
 
 
 def test_debug_mode_sets_dry_run_env_to_avoid_prediction_dump_crashes():
@@ -229,7 +273,12 @@ def test_egregious_overkill_micro_run_is_pruned():
     assert "METRICS" in saved["stdout_tail"]  # debug metrics carried into stdout_tail
     assert context.state["latest_smoke_run"]["metrics"]["overkill_rate"] == 0.9
     assert context.state["inner_iteration"] == 1
-    assert context.state["no_improve_count"] == 1
+    # A single predictive prune bumps the generation-fail counter, NOT no_improve:
+    # under the GENERATION_FAIL_MAX policy (config note: "max probe/debug/script-crash
+    # failures before counting as no_improve"), one noisy 5%-data prune must not
+    # advance the patience/stopping counter. no_improve only ticks after 5 such fails.
+    assert context.state["generation_fail_count"] == 1
+    assert context.state["no_improve_count"] == 0
 
 
 def test_near_target_micro_run_is_not_pruned():

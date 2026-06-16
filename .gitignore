@@ -59,6 +59,13 @@ verify_fixes_*.py
 *.log
 *.json
 
+# Dataset-specific diagnostic / relabeling / probe scripts
+scripts/diag_*.py
+scripts/relabel_*.py
+scripts/tiling_probe*.py
+tests/test_tiling_probe*.py
+aoi-lot-fix/
+
 # PDF / paper files
 *.pdf
 *.txt.bak

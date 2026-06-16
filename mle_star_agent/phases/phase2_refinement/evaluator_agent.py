@@ -16,7 +16,6 @@ from mle_star_agent.guards.code_validator_agent import (
 from mle_star_agent.shared.acceptance_scoring import (
     is_acceptance_improvement,
     metrics_view,
-    passes_relaxed_acceptance,
 )
 from mle_star_agent.shared import code_runner, loop_guard, metric_guard
 from mle_star_agent.shared.code_diff import make_code_diff
@@ -30,13 +29,14 @@ from mle_star_agent.shared.checkpoint_io import (
     load_checkpoint,
     save_checkpoint,
 )
+from mle_star_agent.shared.regression_guard import regression_blocked
 from mle_star_agent.shared.selection_metrics import (
     AVERAGED_EVALUATION_KEY,
     average_metrics_dicts,
     build_selection_evaluation,
 )
 from mle_star_agent.shared.aoi_smoke_triage import build_smoke_diagnostics
-from mle_star_agent.shared.data_split import board_grouped_kfold
+from mle_star_agent.shared.data_split import board_grouped_kfold, stratified_kfold
 from mle_star_agent.shared.metrics_parser import (
     AOIMetrics,
     metrics_to_dict,
@@ -206,11 +206,29 @@ def _harmful_mechanisms_from_tried_approaches(
     return _dedupe_nonempty_strings(rejected)
 
 def _save_best_pipeline(state: dict) -> None:
-    """Persist the authoritative resume snapshot to best_pipeline.json."""
+    """Persist the authoritative resume snapshot to best_pipeline.json.
+
+    Anti-regression guard: if the persistent KB declares a hard floor
+    (an ``is_floor`` entry with ``floor_score.roc_auc``), refuse to overwrite a
+    proven best_pipeline.json with a candidate scoring below that floor. This
+    prevents a cold/collapsed run from clobbering an all-time-best result
+    (the 0.697 -> 0.067 regression this guard was added to fix).
+    """
     current_best_score = float(state.get("current_best_score", 0.0) or 0.0)
     best_miss_rate = state.get("best_miss_rate")
     if best_miss_rate is None:
         best_miss_rate = max(0.0, 1.0 - current_best_score)
+
+    candidate_roc_auc = float(state.get("best_roc_auc", 0.0) or 0.0)
+    blocked, floor = regression_blocked(candidate_roc_auc)
+    if blocked:
+        logger.warning(
+            "REGRESSION BLOCKED: skipping best_pipeline.json write "
+            "(candidate roc_auc %.4f < KB floor %.4f)",
+            candidate_roc_auc,
+            floor,
+        )
+        return
 
     save_checkpoint(config.CKPT_BEST_PIPELINE, {
         "outer_iteration":    state.get("outer_iteration", 0),
@@ -506,7 +524,7 @@ def _script_with_data_split_path(script: str, split_path: Path) -> str:
     return patched
 
 
-def _fold_split_payload(base_split: dict, train_df, val_df, fold_index: int, test_rows: list[dict] | None = None) -> dict:
+def _fold_split_payload(base_split: dict, train_df, val_df, fold_index: int, test_rows: list[dict] | None = None, cv_mode: str = "board_grouped_kfold") -> dict:
     train_rows = train_df.to_dict("records")
     val_rows = val_df.to_dict("records")
     test_rows = list(test_rows or [])
@@ -525,7 +543,7 @@ def _fold_split_payload(base_split: dict, train_df, val_df, fold_index: int, tes
         "val_board_groups": sorted({row.get("board_code") for row in val_rows if row.get("board_code")}),
     })
     metadata = dict(base_split.get("metadata", {}) or {})
-    metadata.update({"cv_fold": fold_index, "cv_mode": "board_grouped_kfold"})
+    metadata.update({"cv_fold": fold_index, "cv_mode": cv_mode})
     return {
         "metadata": metadata,
         "train": train_rows,
@@ -536,18 +554,35 @@ def _fold_split_payload(base_split: dict, train_df, val_df, fold_index: int, tes
 
 
 def _run_board_grouped_cv_confirmation(script: str, k: int = 3) -> tuple[dict | None, list[dict]]:
-    """Run one promising candidate over board-grouped validation folds."""
+    """Run one promising candidate over cross-validation folds.
+
+    The fold scheme matches the active split strategy so the confirmation
+    measures the SAME regime the candidate was trained/selected under:
+      * grouped → board-grouped k-fold (cross-lot holdout per fold)
+      * mixed   → label-stratified k-fold (lots mixed across train/val)
+    Using grouped folds to confirm a mixed candidate would re-impose the
+    cross-lot wall and can wrongly reject an in-distribution candidate.
+    """
     base_split = load_checkpoint(config.CKPT_DATA_SPLIT)
+    strategy = (
+        base_split.get("metadata", {}).get("split_strategy")
+        or getattr(config, "SPLIT_STRATEGY", "grouped")
+    )
     cv_samples = (
         list(base_split.get("train", []) or [])
         + list(base_split.get("val", []) or [])
         + list(base_split.get("test", []) or [])
     )
-    folds = board_grouped_kfold(cv_samples, k=k)
+    if strategy == "mixed":
+        folds = stratified_kfold(cv_samples, k=k)
+        cv_mode = "stratified_kfold"
+    else:
+        folds = board_grouped_kfold(cv_samples, k=k)
+        cv_mode = "board_grouped_kfold"
     fold_results = []
 
     for fold_index, (train_df, val_df) in enumerate(folds, start=1):
-        fold_payload = _fold_split_payload(base_split, train_df, val_df, fold_index, test_rows=[])
+        fold_payload = _fold_split_payload(base_split, train_df, val_df, fold_index, test_rows=[], cv_mode=cv_mode)
         with tempfile.NamedTemporaryFile(
             suffix=f"_aoi_cv_fold_{fold_index}.json",
             mode="w",
@@ -676,7 +711,7 @@ def _confirm_improvement_with_selection_average(
         try:
             averaged_metrics, fold_results = _run_board_grouped_cv_confirmation(script, k=3)
             cv_failure_reason = "one_or_more_cv_folds_failed"
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             averaged_metrics = None
             fold_results = []
             cv_failure_reason = str(exc)
@@ -1209,10 +1244,79 @@ def evaluate_and_update_fn(tool_context) -> str:
     if early_collapse and early_collapse.get("detected"):
         logger.warning("Early collapse detected: %s", early_collapse["pattern"])
 
-    probe_rejected = result.returncode == 0 and probe_rejection_reason is not None
+    # Probe rejection is an EARLY-ABORT signal: it only applies when the run
+    # produced no valid final METRICS (script aborted at probe, or its output
+    # was degenerate). A completed full run with guarded metrics is always
+    # judged on those metrics — a weak epoch-5 probe must not retroactively
+    # discard 20 epochs of real training evidence.
+    probe_rejected = (
+        result.returncode == 0
+        and probe_rejection_reason is not None
+        and metrics is None
+    )
     run_ok      = result.returncode == 0 and metrics is not None and not probe_rejected
     new_score   = float(metrics.ng_recall)    if metrics else 0.0
     new_overkill = float(metrics.overkill_rate) if metrics else 1.0
+
+    if run_ok and metric_guard.is_no_signal_metrics(metrics):
+        m_next = m + 1
+        tool_context.state["inner_iteration"] = m_next
+        tool_context.state["stop_outer_loop"] = True
+        tool_context.state["phase2_abort_reason"] = "no_cross_lot_signal"
+
+        config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        error_analysis_path = config.ckpt_error_analysis(n, m)
+        error_analysis_checkpoint = {
+            "outer_iteration": n,
+            "inner_iteration": m,
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "metrics": metrics_to_dict(metrics),
+            "threshold_curve": threshold_curve,
+            "probe_metrics": probe_metrics,
+            "probe_rejection_reason": probe_rejection_reason,
+            **error_analysis,
+        }
+        save_checkpoint(error_analysis_path, error_analysis_checkpoint)
+        tool_context.state["latest_error_analysis"] = error_analysis_checkpoint
+        tool_context.state["latest_error_analysis_path"] = str(error_analysis_path)
+
+        attempt_data = {
+            "outer_iteration": n,
+            "inner_iteration": m_next,
+            "returncode":      result.returncode,
+            "timed_out":       result.timed_out,
+            "duration_ms":     round(result.duration_ms, 1),
+            "improved":        False,
+            "failure_reason":  "no_cross_lot_signal",
+            "new_score":       new_score,
+            "new_overkill":    new_overkill,
+            "current_best_score":   current_best,
+            "current_best_overkill": current_best_overkill,
+            "no_improve_count":   no_improve,
+            "metrics":         metrics_to_dict(metrics),
+            "smoke_metrics":    smoke_record["metrics"],
+            "smoke_score":      smoke_record["score"],
+            "smoke_diagnostics": smoke_record["diagnostics"],
+            "full_run_executed": True,
+            "full_run_reason":  "no_cross_lot_signal_abort",
+            "error_analysis_checkpoint": str(error_analysis_path),
+            "error_analysis_available": error_analysis.get("available", False),
+            "threshold_curve": threshold_curve,
+            "probe_metrics": probe_metrics,
+            "probe_rejection_reason": probe_rejection_reason,
+            "stdout_tail":     result.stdout[-3000:],
+            "stderr_tail":     result.stderr[-1000:],
+        }
+        save_checkpoint(config.ckpt_refinement(n, m), attempt_data)
+        _save_best_pipeline(tool_context.state)
+        tool_context.actions.escalate = True
+        return (
+            f"[outer={n}, inner={m}] NO_CROSS_LOT_SIGNAL: held-out roc_auc="
+            f"{metrics.roc_auc:.3f} <= {metric_guard.NO_SIGNAL_ROC_AUC_MAX:.2f}; "
+            "no cross-lot signal — needs new strategy. stop_outer_loop=True set; "
+            "refinement halted before accepting or refining this candidate further."
+        )
 
     # Clear instrumentation flag once the script successfully emits per-sample evidence
     if error_analysis.get("available"):
@@ -1282,8 +1386,12 @@ def evaluate_and_update_fn(tool_context) -> str:
     )
     tool_context.state["latest_prediction_verification"] = prediction_verification
     prediction_failed = prediction_verification.get("status") == "failed"
-    if prediction_failed and metrics is not None and not passes_relaxed_acceptance(metrics):
-        improved = False
+    # The prediction contract is a DIAGNOSTIC signal for the planner (it shows
+    # whether the diagnosis hypothesis held), never a veto on a real metric
+    # improvement. The previous veto ("prediction failed and below relaxed
+    # acceptance => improved = False") structurally disabled hill-climbing:
+    # the diagnosis LLM writes optimistic targets, so every incremental gain
+    # (e.g. recall 0.3 -> 0.6) was rejected and the best score stayed at 0.
 
     # Capture the previous best script BEFORE the improvement block can overwrite
     # it below; the persistent KB diff is prev_best -> current.
@@ -1554,6 +1662,28 @@ def evaluate_and_update_fn(tool_context) -> str:
     cv_summary = _format_cv_evaluation(selection_evaluation)
     if cv_summary:
         summary_prefix = f"{summary_prefix}\n{cv_summary}"
+
+    # ---- Priority 1: no acceptable path remains ----
+    # Below relaxed acceptance, the historical behavior was to restart outer
+    # diagnosis indefinitely after stagnation. Once the current ablation evidence
+    # contains no relaxed-acceptable result and the existing below-relaxed
+    # no-improve threshold has been reached, stop the outer loop instead.
+    if loop_guard.should_stop_when_no_acceptable_path_remains(tool_context.state):
+        tool_context.state["stop_outer_loop"] = True
+        tool_context.state["phase2_abort_reason"] = "no_acceptable_path_remaining"
+        _save_best_pipeline(tool_context.state)
+        tool_context.actions.escalate = True
+        logger.info(
+            "Early-stop triggered: no acceptable path remains after current ablation evidence."
+        )
+        return (
+            f"{summary_prefix}\n"
+            "EARLY_STOP (no acceptable path remains): current best is below relaxed "
+            "acceptance, no ablation result satisfies relaxed acceptance, and the "
+            f"below-relaxed no-improve streak reached "
+            f"{config.INNER_STAGNATION_MAX_UNCONSTRAINED}. stop_outer_loop=True set. "
+            "Escalating inner loop; outer loop exits on next ablation_flag_checker call."
+        )
 
     # ---- Priority 1a: high-overkill bounded restart ----
     # Fires when overkill >= 0.50 after INNER_STAGNATION_MAX_HIGH_OVERKILL attempts,

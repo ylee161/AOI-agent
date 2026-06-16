@@ -6,6 +6,7 @@ from google.adk.tools import FunctionTool
 
 from mle_star_agent import config
 from mle_star_agent.shared.callbacks import (
+    _make_bypass_response,
     budget_stop_callback,
     count_tokens_callback,
     log_context_size_callback,
@@ -295,6 +296,30 @@ _write_report_tool = FunctionTool(func=write_error_analysis_report_fn)
 _check_gate_tool = FunctionTool(func=check_error_analysis_gate_fn)
 
 
+def _bypass_error_gate(callback_context, llm_request):
+    try:
+        result = check_error_analysis_gate_fn(callback_context)
+        return _make_bypass_response(result)
+    except Exception as exc:
+        logger.warning("bypass_error_gate: exception — falling back to LLM: %s", exc)
+        return None
+
+
+def _bypass_error_analysis_ckpt(callback_context, llm_request):
+    """Skip the agent when evidence is absent or the interpretation checkpoint exists."""
+    try:
+        evidence_result = load_latest_error_analysis_fn(callback_context)
+        if "ERROR_ANALYSIS_MISSING" in evidence_result:
+            return _make_bypass_response(evidence_result)
+        ckpt_result = check_error_analysis_report_checkpoint_fn(callback_context)
+        if ckpt_result.startswith("CHECKPOINT_FOUND"):
+            return _make_bypass_response(ckpt_result)
+        return None  # evidence present, no valid checkpoint → let LLM interpret
+    except Exception as exc:
+        logger.warning("bypass_error_analysis_ckpt: exception — falling back to LLM: %s", exc)
+        return None
+
+
 _GATE_INSTRUCTION = """You are the Error Analysis Gate for Phase 2 Refinement.
 
 Call `check_error_analysis_gate_fn` immediately.
@@ -399,7 +424,7 @@ error_analysis_gate_agent = LlmAgent(
     instruction=_GATE_INSTRUCTION,
     tools=[_check_gate_tool],
     include_contents="none",
-    before_model_callback=log_context_size_callback,
+    before_model_callback=[_bypass_error_gate, log_context_size_callback],
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )
@@ -416,7 +441,7 @@ error_analysis_agent = LlmAgent(
     instruction=_INSTRUCTION,
     tools=[_load_latest_tool, _check_report_ckpt_tool, _write_report_tool],
     include_contents="none",
-    before_model_callback=[log_context_size_callback, budget_stop_callback],
+    before_model_callback=[_bypass_error_analysis_ckpt, log_context_size_callback, budget_stop_callback],
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )

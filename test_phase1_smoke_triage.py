@@ -37,13 +37,39 @@ def _result(stdout, returncode=0, duration_ms=5000.0):
     )
 
 
+def _guard_passing_script(marker):
+    """Minimal script body that passes the static stub guard in run_slot_fn
+    (>= 50 lines and defines build_model)."""
+    filler = "\n".join(f"# filler line {i}" for i in range(60))
+    return f"# marker: {marker}\ndef build_model():\n    pass\n{filler}\n"
+
+
 def _candidate(slot=0, name=None, script=None):
     name = name or f"candidate_{slot}"
     return {
         "name": name,
         "architecture": "stub",
-        "script": script or f"print('{name}')",
+        "script": _guard_passing_script(script or name),
     }
+
+
+def test_phase1_stub_script_is_rejected_without_running():
+    context = _FakeContext([{
+        "name": "stubby",
+        "architecture": "stub",
+        "script": "print('METRICS: {}')",
+    }])
+    run_slot = _MODULE._make_run_slot_fn(0)
+
+    with mock.patch.object(_MODULE.code_runner, "run_script") as run_script:
+        message = run_slot(context)
+
+    result = context.state["candidate_result_0"]
+    assert run_script.call_count == 0
+    assert "REJECTED" in message
+    assert result["status"] == "failed"
+    assert result["full_run_reason"] == "stub_or_truncated_script"
+    assert result["metrics"] is None
 
 
 def test_phase1_egregious_smoke_candidate_is_skipped():
@@ -104,10 +130,16 @@ def test_phase1_missing_smoke_metrics_candidate_gets_full_run():
     smoke = _result("epoch 1 done; no metrics block emitted here", duration_ms=5000.0)
     full = _result(_metrics_line(tp=98, tn=93, fp=7, fn=2), duration_ms=60000.0)
 
-    with mock.patch.object(_MODULE, "NUM_SLOTS", 1), \
-         mock.patch.object(_MODULE.code_runner, "run_script", side_effect=[smoke, full, full, full]) as run_script:
-        run_slot(context)
-        _MODULE.consolidate_candidate_scores_fn(context)
+    with tempfile.TemporaryDirectory() as tmp:
+        checkpoint_dir = Path(tmp)
+        with (
+            mock.patch.object(config, "CHECKPOINT_DIR", checkpoint_dir),
+            mock.patch.object(config, "CKPT_CANDIDATE_SCORES", checkpoint_dir / "candidate_scores.json"),
+            mock.patch.object(_MODULE, "NUM_SLOTS", 1),
+            mock.patch.object(_MODULE.code_runner, "run_script", side_effect=[smoke, full, full, full]) as run_script,
+        ):
+            run_slot(context)
+            _MODULE.consolidate_candidate_scores_fn(context)
 
     result = context.state["candidate_scores"][0]
     assert run_script.call_count == 4

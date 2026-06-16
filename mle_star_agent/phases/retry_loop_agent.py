@@ -30,6 +30,7 @@ from google.adk.utils.context_utils import Aclosing
 from mle_star_agent import config
 from mle_star_agent.phases.phase2_refinement.ablation_agent import NUM_ABLATION_VARIANTS
 from mle_star_agent.shared.checkpoint_io import save_checkpoint
+from mle_star_agent.shared.regression_guard import regression_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -120,24 +121,42 @@ def _reset_for_retry(state, attempt: int) -> None:
     )
     best_accuracy = _state_or_recovered(state, recovered, "best_accuracy", "accuracy", 0.0)
     best_f1 = _state_or_recovered(state, recovered, "best_f1", "f1", 0.0)
-    save_checkpoint(config.CKPT_BEST_PIPELINE, {
-        "outer_iteration":    0,
-        "inner_iteration":    0,
-        "no_improve_count":   0,
-        "current_best_score": best_score,
-        "best_overkill_rate": best_overkill,
-        "best_miss_rate":     best_miss,
-        "best_accuracy":      best_accuracy,
-        "best_f1":            best_f1,
-        "best_pipeline_script": best_script,
-        "ensemble_best_score": best_score,
-        "ensemble_best_overkill": best_overkill,
-        "ensemble_best_accuracy": best_accuracy,
-        "ensemble_best_f1":    best_f1,
-        "refinement_population": state.get("refinement_population", []),
-        "token_count":        0,
-        "stop_outer_loop":    False,
-    })
+
+    # Anti-regression guard: never rewrite best_pipeline.json with a script that
+    # scores below the proven KB hard floor. Recover roc_auc from state (or fall
+    # back to the score axis) before consulting the floor.
+    candidate_roc_auc = _state_or_recovered(
+        state, recovered, "best_roc_auc", "roc_auc", best_score
+    )
+    blocked, floor = regression_blocked(candidate_roc_auc)
+    if blocked:
+        # Leave the proven best_pipeline.json untouched, but still reset the
+        # in-memory loop state below so the retry attempt can proceed.
+        logger.warning(
+            "REGRESSION BLOCKED: skipping best_pipeline.json rewrite on retry "
+            "(candidate roc_auc %.4f < KB floor %.4f)",
+            float(candidate_roc_auc or 0.0),
+            floor,
+        )
+    else:
+        save_checkpoint(config.CKPT_BEST_PIPELINE, {
+            "outer_iteration":    0,
+            "inner_iteration":    0,
+            "no_improve_count":   0,
+            "current_best_score": best_score,
+            "best_overkill_rate": best_overkill,
+            "best_miss_rate":     best_miss,
+            "best_accuracy":      best_accuracy,
+            "best_f1":            best_f1,
+            "best_pipeline_script": best_script,
+            "ensemble_best_score": best_score,
+            "ensemble_best_overkill": best_overkill,
+            "ensemble_best_accuracy": best_accuracy,
+            "ensemble_best_f1":    best_f1,
+            "refinement_population": state.get("refinement_population", []),
+            "token_count":        0,
+            "stop_outer_loop":    False,
+        })
 
     # ── Token counter — reset so flash downgrade doesn't bleed into next attempt
     state["token_count"] = 0

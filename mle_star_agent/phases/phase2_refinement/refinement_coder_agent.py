@@ -374,6 +374,7 @@ make optimizer and learning-rate schedule a first-class, isolated refinement:
   `sgd_momentum_plateau` -> `torch.optim.SGD(..., lr=..., momentum=0.9,
   nesterov=True, weight_decay=...)` with `ReduceLROnPlateau(optimizer, mode="min",
   factor=..., patience=..., min_lr=...)` stepped as `scheduler.step(val_loss)`.
+  Do NOT pass `verbose=` to `ReduceLROnPlateau`; this runtime's PyTorch build rejects that keyword.
   `adamw_plateau_decay` -> AdamW with tuned lr/weight_decay and
   `ReduceLROnPlateau` stepped on validation loss.
   `warm_restart_*` -> keep the existing optimizer family unless the selected
@@ -513,7 +514,7 @@ The script must:
   where `roc_auc = sklearn.metrics.roc_auc_score(y_true_binary, ng_probs)` on the test set
   (y_true_binary: 1=NG, 0=G; emit 0.0 if only one class present), and
   `prob_gap = mean(ng_probs[true==NG]) - mean(ng_probs[true==G])` (positive = good separability)
-- Load train/val/test paths and sample IDs from `checkpoints/data_split_grouped.json` (the grouped split is the default since mini-goal 7; do NOT use the legacy `checkpoints/data_split.json`) — the script runs as a standalone process with no ADK state access. Use: `import json; data_split = json.load(open("checkpoints/data_split_grouped.json"))`
+- Load train/val/test paths and sample IDs from `__DATA_SPLIT_PATH__` (do NOT use the legacy `checkpoints/data_split.json`) — the script runs as a standalone process with no ADK state access. Use: `import json; data_split = json.load(open("__DATA_SPLIT_PATH__"))`
 - Seed ALL random number generators from the environment before any model or data loader
   initialization (this is mandatory — the evaluator injects AOI_RANDOM_SEED for reproducibility):
   ```python
@@ -522,7 +523,7 @@ The script must:
   random.seed(_seed); np.random.seed(_seed); torch.manual_seed(_seed); torch.cuda.manual_seed_all(_seed)
   ```
 - You MUST set `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20` with early stopping patience 3 epochs based on validation loss. Do NOT hardcode 5 — the line must read exactly `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20`.
-- Use a real PyTorch learning-rate schedule instead of a fixed LR. Prefer either `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)` (SGDR) or `torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)`. Instantiate the scheduler after the optimizer and call `scheduler.step()` correctly in the training loop: for `CosineAnnealingWarmRestarts`, step once per epoch (or batch with fractional epoch); for `ReduceLROnPlateau`, call `scheduler.step(val_loss)` after validation loss is computed. The validator will hard-reject schedule-less scripts.
+- Use a real PyTorch learning-rate schedule instead of a fixed LR. Prefer either `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)` (SGDR) or `torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)`. Instantiate the scheduler after the optimizer and call `scheduler.step()` correctly in the training loop: for `CosineAnnealingWarmRestarts`, step once per epoch (or batch with fractional epoch); for `ReduceLROnPlateau`, call `scheduler.step(val_loss)` after validation loss is computed. Do NOT pass `verbose=` to `ReduceLROnPlateau`; this runtime's PyTorch build rejects that keyword. The validator will hard-reject schedule-less scripts.
 - Respect `config.TIMEOUT_SECONDS` (7200 s / 2 hours) — keep the script fast enough to finish
 - Must print `EPOCH_LOG: {{...}}` after each epoch (epoch, train_loss, val_loss, val_ng_recall, val_overkill)
 - Must print `PROBE_METRICS: {{...}}` before full training (ng_recall, overkill_rate,
@@ -557,6 +558,11 @@ Rules:
 This final response is captured verbatim as `state["current_script"]` and passed
 directly to the evaluator.  Any non-Python text will cause execution to fail.
 """
+
+# Bind the active data-split checkpoint path into the prompt so refinement
+# scripts load the split matching config.SPLIT_STRATEGY (grouped vs mixed),
+# matching the substitution the ensemble/submission coders already use.
+_INSTRUCTION = _INSTRUCTION.replace("__DATA_SPLIT_PATH__", str(config.CKPT_DATA_SPLIT))
 
 # ---------------------------------------------------------------------------
 # Refinement coder agent

@@ -5,10 +5,24 @@ from typing import Optional
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
+from google.genai import types as _genai_types
 
 from mle_star_agent import config
 
 logger = logging.getLogger(__name__)
+
+
+def _make_bypass_response(text: str) -> LlmResponse:
+    """Return an LlmResponse that short-circuits the model call.
+
+    Returned from a before_model_callback to skip the LLM entirely and deliver
+    the pre-computed text as the agent's response.
+    """
+    return LlmResponse(
+        content=_genai_types.Content(
+            role="model", parts=[_genai_types.Part(text=text)]
+        )
+    )
 
 
 def log_context_size_callback(

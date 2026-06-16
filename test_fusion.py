@@ -249,7 +249,21 @@ class FusionStrategyGateTests(unittest.TestCase):
         self.assertFalse(ctx.state.get("pending_fusion", False))
 
     def test_fusion_directive_routes_through_evaluate_and_updates_population_and_kb(self):
-        fused_script = "# FUSED candidate\nmodel = base_with_donor_loss()\nprint('ok')\n"
+        # >=10 lines so it clears the stub-script KB-write guard (evaluator skips the
+        # KB write for scripts with < 10 lines, treating them as untrained stubs).
+        fused_script = (
+            "# FUSED candidate\n"
+            "import torch\n"
+            "import torch.nn as nn\n"
+            "def base_with_donor_loss():\n"
+            "    return nn.Linear(10, 2)\n"
+            "model = base_with_donor_loss()\n"
+            "criterion = nn.CrossEntropyLoss()\n"
+            "optimizer = torch.optim.AdamW(model.parameters())\n"
+            "for epoch in range(3):\n"
+            "    pass\n"
+            "print('ok')\n"
+        )
         directive = fusion.build_fusion_directive(
             {"input_modality": "stereo"},
             [

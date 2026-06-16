@@ -16,6 +16,7 @@ from google.adk.tools import FunctionTool
 
 from mle_star_agent import config
 from mle_star_agent.shared.callbacks import (
+    _make_bypass_response,
     budget_stop_callback,
     count_tokens_callback,
     log_context_size_callback,
@@ -1180,6 +1181,16 @@ def ensure_selected_strategy_fn(tool_context) -> str:
 
 _ensure_strategy_tool = FunctionTool(func=ensure_selected_strategy_fn)
 
+
+def _bypass_strategy_gate(callback_context, llm_request):
+    try:
+        result = ensure_selected_strategy_fn(callback_context)
+        return _make_bypass_response(result)
+    except Exception as exc:
+        logger.warning("bypass_strategy_gate: exception — falling back to LLM: %s", exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Planner instruction
 # ---------------------------------------------------------------------------
@@ -1313,9 +1324,17 @@ Determine the active target component first:
 - Otherwise use `diagnosis_report.target_component`.
 Valid target components include architecture/model capacity, augmentation,
 weighted_loss, stereo_fusion, calibration, threshold_sweep, preprocessing/
-lot_normalization, and `optimizer/lr-schedule`. The optimizer target is first
-class: choose it when plateau evidence, unstable validation loss, or prior
-fixed optimizer/scheduler settings are the likely bottleneck.
+lot_normalization, `input_resolution`, and `optimizer/lr-schedule`. The optimizer
+target is first class: choose it when plateau evidence, unstable validation loss,
+or prior fixed optimizer/scheduler settings are the likely bottleneck.
+
+`input_resolution` is a high-leverage, cheap-to-author axis on this dataset: the
+raw boards are 4K images and defects occupy only a few pixels after the default
+224px resize, so the global downsample itself caps the separable signal. The
+script reads `IMAGE_SIZE = int(os.getenv('AOI_IMAGE_SIZE', '224'))` — a resolution
+variant only needs that default raised (e.g. 320/384/448); the on-disk image cache
+is keyed by size, so only the first epoch pays the 4K decode cost. Budget roughly
+(size/224)^2 compute per step; prefer 320-448 before anything larger.
 
 For the active target component, propose exactly 3 strategies that are
 mechanistically distinct from each other, from the recent `changes_summary` entries
@@ -1509,7 +1528,7 @@ strategy_gate_agent = LlmAgent(
     instruction=_GATE_INSTRUCTION,
     tools=[_ensure_strategy_tool],
     include_contents="none",
-    before_model_callback=log_context_size_callback,
+    before_model_callback=[_bypass_strategy_gate, log_context_size_callback],
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )

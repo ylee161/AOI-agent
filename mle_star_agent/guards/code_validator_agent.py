@@ -117,6 +117,10 @@ def generated_script_contract_rejection_reasons(script: str) -> list[str]:
         reasons.append(
             "ViT/transformer backbone detected without FEATURE_DIFF_CANDIDATE=True -- patch embedding must not be adapted to 9-channel input"
         )
+    if re.search(r"ReduceLROnPlateau\s*\([^)]*\bverbose\s*=", script, re.DOTALL):
+        reasons.append(
+            "ReduceLROnPlateau verbose kwarg is unsupported in this runtime -- remove verbose="
+        )
     if _EPOCH_TERNARY_CONTRACT_RE.search(script) is None:
         reasons.append(
             "missing epoch ternary: epochs = DRY_RUN_EPOCHS if DRY_RUN else"
@@ -437,7 +441,7 @@ The AOI grouped train split has only about 287 samples. The validator must flag 
 rewrite candidates with any of these risks:
 - large added parameter capacity with no regularization: no backbone freeze,
   no partial freeze, no dropout, and no nonzero weight_decay;
-- legacy `checkpoints/data_split.json` usage instead of `checkpoints/data_split_grouped.json`;
+- legacy `checkpoints/data_split.json` usage instead of the active grouped/mixed split checkpoint (`data_split_grouped.json` or `data_split_mixed.json`);
 - missing `roc_auc`, `prob_gap`, or `THRESHOLD_CURVE` reporting;
 - missing degenerate/flat-prediction warning logic such as score-range,
   unique-score, or `DEGENERATE_PREDICTION_WARNING` / `DEGENERATE_THRESHOLD_WARNING`;

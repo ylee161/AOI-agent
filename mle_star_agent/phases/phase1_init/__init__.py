@@ -4,6 +4,7 @@ from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.tools import FunctionTool
 
 from mle_star_agent import config
+from mle_star_agent.shared.callbacks import _make_bypass_response
 from mle_star_agent.phases.phase1_init.baseline_coder_agent import baseline_coder_agent
 from mle_star_agent.phases.phase1_init.candidate_evaluator_agent import (
     _PHASE1_FAILURE_STATUSES,
@@ -82,6 +83,15 @@ def check_phase1_done_fn(tool_context) -> str:
     return f"PHASE1_NEEDED: missing {missing} — running Phase 1 normally."
 
 
+def _bypass_phase1_gate(callback_context, llm_request):
+    try:
+        result = check_phase1_done_fn(callback_context)
+        return _make_bypass_response(result)
+    except Exception as exc:
+        logger.warning("bypass_phase1_gate: exception — falling back to LLM: %s", exc)
+        return None
+
+
 _phase1_skip_gate = LlmAgent(
     name="phase1_skip_gate",
     model=config.MODEL,
@@ -93,6 +103,7 @@ _phase1_skip_gate = LlmAgent(
     ),
     tools=[FunctionTool(func=check_phase1_done_fn)],
     include_contents="none",
+    before_model_callback=_bypass_phase1_gate,
 )
 
 phase1_init = SequentialAgent(

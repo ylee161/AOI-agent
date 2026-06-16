@@ -46,6 +46,66 @@ def _load_label_map(xlsx_path: Path) -> dict:
     return label_map
 
 
+# Per-side defect-count columns. per_side labelling needs the number of defects
+# on each side of the board so a side can be labelled NG iff its OWN count > 0.
+# Listed case-insensitively; a dataset without these columns falls back to board
+# labelling (see dataset_supports_per_side), keeping the pipeline reusable.
+_NG_SUM_L_CANDIDATES = ["NG_SUM_L", "ng_sum_l", "NGSUM_L", "NG_L", "ngsum_l"]
+_NG_SUM_R_CANDIDATES = ["NG_SUM_R", "ng_sum_r", "NGSUM_R", "NG_R", "ngsum_r"]
+
+
+def _find_col_optional(df: "pd.DataFrame", candidates: list):
+    """Like _find_col but returns None instead of raising when nothing matches."""
+    lower_map = {c.lower(): c for c in df.columns}
+    for name in candidates:
+        if name.lower() in lower_map:
+            return lower_map[name.lower()]
+    return None
+
+
+def dataset_supports_per_side(dataset_folders: List[str]) -> bool:
+    """True iff every lot's label sheet carries per-side NG-count columns."""
+    for lot_folder in dataset_folders:
+        try:
+            df = pd.read_excel(_find_xlsx(lot_folder), sheet_name=0)
+        except Exception:
+            return False
+        if (_find_col_optional(df, _NG_SUM_L_CANDIDATES) is None
+                or _find_col_optional(df, _NG_SUM_R_CANDIDATES) is None):
+            return False
+    return True
+
+
+def _load_side_label_map(xlsx_path: Path) -> dict:
+    """Return {(row, col): {"L": "NG"/"G", "R": "NG"/"G", "board": "NG"/"G"}}.
+
+    Side label = NG iff that side's own defect count (NG_SUM_L / NG_SUM_R) > 0 —
+    this is what removes the clean-side dilution. The board label reuses the
+    canonical TestResult mapping so board-pooled metrics stay comparable to
+    "board" mode. Callers gate on dataset_supports_per_side() first.
+    """
+    df = pd.read_excel(xlsx_path, sheet_name=0)
+    row_col = _find_col(df, ["Row", "row", "ROW", "y"])
+    col_col = _find_col(df, ["Column", "column", "Col", "col", "COL", "x"])
+    result_col = _find_col(df, ["TestResult", "testresult", "Result", "result", "label", "Label"])
+    ng_l_col = _find_col(df, _NG_SUM_L_CANDIDATES)
+    ng_r_col = _find_col(df, _NG_SUM_R_CANDIDATES)
+    df = df.dropna(subset=[row_col, col_col, result_col, ng_l_col, ng_r_col])
+    out = {}
+    for _, r in df.iterrows():
+        key = (int(r[row_col]), int(r[col_col]))
+        board = normalize_label(
+            str(r[result_col]).strip(), strict=True,
+            context=f"(row={key[0]}, col={key[1]}) of {xlsx_path}",
+        )
+        out[key] = {
+            "L": "NG" if float(r[ng_l_col]) > 0 else "G",
+            "R": "NG" if float(r[ng_r_col]) > 0 else "G",
+            "board": board,
+        }
+    return out
+
+
 def _build_pairs(lot_folder: str) -> dict:
     """Return {pair_key: {"img_l": path, "img_r": path}} for one lot folder."""
     pairs: dict = {}
@@ -266,6 +326,36 @@ def board_grouped_kfold(samples: list, k: int = 3, random_state: int = 42) -> li
     return folds
 
 
+def stratified_kfold(samples: list, k: int = 3, random_state: int = 42) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    Return label-stratified train/val folds for the MIXED (in-distribution) regime.
+
+    Mirrors ``board_grouped_kfold``'s return shape (list of (train_df, val_df))
+    but imposes NO lot/board grouping — every fold's val set is a stratified
+    random slice, so lots are mixed across train and val exactly as in the mixed
+    split itself. Use this (not the grouped k-fold) to confirm a candidate that
+    was trained and selected under ``SPLIT_STRATEGY="mixed"``; using the grouped
+    k-fold there would measure a different (cross-lot) regime and can wrongly
+    reject an in-distribution candidate.
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    if k < 2:
+        raise ValueError("k must be at least 2")
+    if not samples:
+        raise ValueError("samples must not be empty")
+
+    rows = [dict(s) for s in samples]
+    labels = [r.get("label") for r in rows]
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=random_state)
+    folds = []
+    for train_idx, val_idx in skf.split(rows, labels):
+        train_rows = [rows[i] for i in train_idx]
+        val_rows = [rows[i] for i in val_idx]
+        folds.append((pd.DataFrame(train_rows), pd.DataFrame(val_rows)))
+    return folds
+
+
 def detect_input_modality(dataset_folders: List[str]) -> str:
     """Auto-detect whether the dataset is stereo (paired _L_/_R_ PNGs) or mono.
 
@@ -307,24 +397,84 @@ def detect_input_modality(dataset_folders: List[str]) -> str:
     )
 
 
-def build_data_split(dataset_folders: List[str]) -> dict:
+def build_data_split(dataset_folders: List[str], label_granularity: str = "board", split_strategy: str = "grouped") -> dict:
     """
-    Collect stereo pairs and labels from all lot folders, then produce a
+    Collect samples and labels from all lot folders, then produce a
     board-grouped 70/15/15 train/val/test split.
 
     Samples from the same VHB board group are kept in the same partition to
     prevent board-specific pattern leakage between train and held-out sets.
 
+    ``label_granularity`` (default "board" so the function's standalone behaviour
+    is unchanged; the live pipeline passes ``config.LABEL_GRANULARITY``):
+      * "board"    — one stereo (or mono) sample per board, board G/NG label.
+      * "per_side" — each side of a stereo pair becomes its own 3-channel mono
+        sample, labelled NG iff its OWN defect count > 0. Each sample also carries
+        ``board_id`` and ``board_label`` so training can pool the two sides back
+        to a board score (max) at eval and preserve the board-level metric.
+        Falls back to "board" (with a warning) when the dataset is not stereo or
+        lacks per-side defect columns, keeping the pipeline reusable.
+
     Returns a dict suitable for JSON serialisation and writing to state.
     """
     modality = detect_input_modality(dataset_folders)
+
+    per_side = label_granularity == "per_side"
+    if per_side and modality != "stereo":
+        logger.warning(
+            "per_side labelling requires stereo pairs but dataset is %s — "
+            "falling back to board labelling.", modality,
+        )
+        per_side = False
+    if per_side and not dataset_supports_per_side(dataset_folders):
+        logger.warning(
+            "per_side labelling requested but per-side defect columns "
+            "(NG_SUM_L / NG_SUM_R) are missing — falling back to board labelling.",
+        )
+        per_side = False
+    used_granularity = "per_side" if per_side else "board"
+
     samples = []
 
     for lot_folder in dataset_folders:
         xlsx_path = _find_xlsx(lot_folder)
-        label_map = _load_label_map(xlsx_path)
         lot_name = str(Path(lot_folder).name)
         board_code = _extract_board_code(lot_name)
+
+        if per_side:
+            # Each side becomes its own mono sample, labelled by its own defects.
+            # NOTE (honest framing): this attacks the under-learning / clean-side
+            # dilution axis (it ~doubles samples); it does NOT add lots, so it
+            # cannot move the cross-lot domain-shift wall.
+            side_map = _load_side_label_map(xlsx_path)
+            for pair_key, sides in _build_pairs(lot_folder).items():
+                if "img_l" not in sides or "img_r" not in sides:
+                    logger.warning("Incomplete stereo pair skipped: %s", pair_key)
+                    continue
+                try:
+                    row, col = _row_col_from_key(pair_key)
+                except (ValueError, IndexError):
+                    logger.warning("Cannot parse row/col from pair key: %s", pair_key)
+                    continue
+                sm = side_map.get((row, col))
+                if sm is None:
+                    logger.warning("No label for (%d, %d) in %s — skipping", row, col, lot_folder)
+                    continue
+                board_id = f"{lot_name}/{pair_key}"
+                for side, img_key in (("L", "img_l"), ("R", "img_r")):
+                    samples.append({
+                        "sample_id": f"{board_id}::{side}",
+                        "board_id": board_id,
+                        "lot": lot_name,
+                        "board_code": board_code,
+                        "side": side,
+                        "img": sides[img_key],
+                        "label": sm[side],
+                        "board_label": sm["board"],
+                    })
+            continue
+
+        label_map = _load_label_map(xlsx_path)
 
         if modality == "mono":
             for png in Path(lot_folder).glob("*.png"):
@@ -388,15 +538,80 @@ def build_data_split(dataset_folders: List[str]) -> dict:
     board_codes = sorted({s["board_code"] for s in samples})
     logger.info("Board groups found (%d): %s", len(board_codes), board_codes)
 
-    train_ids, val_ids, test_ids = _board_grouped_split(samples)
+    if split_strategy == "mixed":
+        # Simple stratified random split — all lots appear in every partition.
+        # This is the in-distribution ("MIXED") regime where the 0.65–0.71
+        # results were produced. No lot-grouping constraint is applied.
+        if per_side:
+            # For per_side, split at board level first to keep both sides together.
+            board_reps, seen = [], set()
+            for s in samples:
+                if s["board_id"] in seen:
+                    continue
+                seen.add(s["board_id"])
+                board_reps.append({"sample_id": s["board_id"], "board_code": s["board_code"], "label": s["board_label"]})
+            rep_ids = [r["sample_id"] for r in board_reps]
+            rep_labels = [r["label"] for r in board_reps]
+            tr_b, temp_b, _, temp_l = train_test_split(rep_ids, rep_labels, test_size=0.30, stratify=rep_labels, random_state=42)
+            val_b, test_b = train_test_split(temp_b, test_size=0.50, stratify=temp_l, random_state=42)
+            partition = {bid: p for p, ids in (("train", tr_b), ("val", val_b), ("test", test_b)) for bid in ids}
+            buckets: dict = {"train": [], "val": [], "test": []}
+            for s in samples:
+                dest = partition.get(s["board_id"])
+                if dest is not None:
+                    buckets[dest].append(s)
+            train_ids = [s["sample_id"] for s in buckets["train"]]
+            val_ids = [s["sample_id"] for s in buckets["val"]]
+            test_ids = [s["sample_id"] for s in buckets["test"]]
+        else:
+            ids = [s["sample_id"] for s in samples]
+            lbls = [s["label"] for s in samples]
+            train_ids, temp_ids, _, temp_lbls = train_test_split(ids, lbls, test_size=0.30, stratify=lbls, random_state=42)
+            val_ids, test_ids = train_test_split(temp_ids, test_size=0.50, stratify=temp_lbls, random_state=42)
+        logger.info("Mixed split: train=%d val=%d test=%d (all lots in every partition)", len(train_ids), len(val_ids), len(test_ids))
+    elif per_side:
+        # Grouped + per_side: split at the BOARD level so both sides of a board
+        # always land in the same partition, then expand to side samples.
+        board_reps, seen = [], set()
+        for s in samples:
+            if s["board_id"] in seen:
+                continue
+            seen.add(s["board_id"])
+            board_reps.append({
+                "sample_id": s["board_id"],
+                "board_code": s["board_code"],
+                "label": s["board_label"],
+            })
+        tr_b, val_b, test_b = _board_grouped_split(board_reps)
+        partition = {}
+        for name, ids in (("train", tr_b), ("val", val_b), ("test", test_b)):
+            for bid in ids:
+                partition[bid] = name
+        gbuckets: dict = {"train": [], "val": [], "test": []}
+        for s in samples:
+            dest = partition.get(s["board_id"])
+            if dest is not None:
+                gbuckets[dest].append(s)
+        train_ids = [s["sample_id"] for s in gbuckets["train"]]
+        val_ids = [s["sample_id"] for s in gbuckets["val"]]
+        test_ids = [s["sample_id"] for s in gbuckets["test"]]
+    else:
+        train_ids, val_ids, test_ids = _board_grouped_split(samples)
 
     sample_map = {s["sample_id"]: s for s in samples}
 
     def subset(id_list):
         return [sample_map[i] for i in id_list]
 
+    # per_side emits single 3-channel images, so downstream modality-aware logic
+    # (augmentation safety, stereo-fusion gates) must see "mono".
+    recorded_modality = "mono" if per_side else modality
     split = {
-        "metadata": {"input_modality": modality},
+        "metadata": {
+            "input_modality": recorded_modality,
+            "label_granularity": used_granularity,
+            "split_strategy": split_strategy,
+        },
         "train": subset(train_ids),
         "val": subset(val_ids),
         "test": subset(test_ids),

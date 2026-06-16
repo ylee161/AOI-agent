@@ -159,7 +159,9 @@ class AblationCompletenessTests(unittest.TestCase):
         self.assertIn("fp_penalty_loss", names)
         self.assertIn("temperature_scaling", names)
         self.assertIn("lot_normalization", names)
-        self.assertIn("training_schedule", names)
+        # Factorial-ablation refactor (commit 5967065) replaced the standalone
+        # "training_schedule" probe with the "optimizer_lr_schedule" probe.
+        self.assertIn("optimizer_lr_schedule", names)
 
     def test_partial_ablation_results_are_not_complete(self):
         from mle_star_agent.phases.phase2_refinement.ablation_agent import (
@@ -186,7 +188,14 @@ class AblationCompletenessTests(unittest.TestCase):
 
         self.assertTrue(_is_complete_ablation_results(complete))
 
-    def test_skipped_ablation_variants_do_not_count_as_complete_evidence(self):
+    def test_skipped_ablation_variants_fill_their_slot(self):
+        # Under factorial + targeted ablation (commit 5967065), a "skipped" variant
+        # is a legitimate, intended outcome (mono drops stereo-off; targeted later
+        # iterations skip low-impact variants). It still fills its slot, so the
+        # SLOT-completeness check counts it — otherwise targeted iterations could
+        # never complete and would loop forever. The guard against running diagnosis
+        # on zero real evidence lives in the diagnosis checkpoint gate + empty-ranking
+        # scorer, not in _is_complete_ablation_results.
         from mle_star_agent.phases.phase2_refinement.ablation_agent import (
             NUM_ABLATION_VARIANTS,
             _is_complete_ablation_results,
@@ -197,7 +206,12 @@ class AblationCompletenessTests(unittest.TestCase):
             for i in range(NUM_ABLATION_VARIANTS)
         ]
 
-        self.assertFalse(_is_complete_ablation_results(skipped))
+        self.assertTrue(_is_complete_ablation_results(skipped))
+
+        # But a set still MISSING variant indices is never slot-complete, even if
+        # every present result was skipped — this is the real completeness guard.
+        missing_one = skipped[:-1]
+        self.assertFalse(_is_complete_ablation_results(missing_one))
 
     def test_ablation_variant_generation_uses_pro_model(self):
         import importlib
@@ -820,8 +834,11 @@ class InnerStagnationPolicyTests(unittest.TestCase):
                 })
                 self.actions = FakeActions()
 
-        stdout = 'METRICS: {"tp": 27, "tn": 21, "fp": 9, "fn": 4, "threshold": 0.2, "avg_latency_ms": 1}'
-        result = mock.Mock(returncode=0, timed_out=False, duration_ms=12.0, stdout=stdout, stderr="")
+        # prob_gap + a >=30s runtime keep this realistic full run out of the
+        # degenerate-metrics guard (metric_guard rejects prob_gap==0 and runtime
+        # < 30s as dummy-split poisoning) so it reaches the stagnation logic.
+        stdout = 'METRICS: {"tp": 27, "tn": 21, "fp": 9, "fn": 4, "threshold": 0.2, "avg_latency_ms": 1, "prob_gap": 0.4}'
+        result = mock.Mock(returncode=0, timed_out=False, duration_ms=60000.0, stdout=stdout, stderr="")
 
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_dir = Path(tmp)
@@ -1162,13 +1179,21 @@ class ValidatorContractPolicyTests(unittest.TestCase):
 
         self.assertIsNone(refinement_coder_agent.before_model_callback)
 
-    def test_coder_instructions_require_fp_budget_before_threshold_sweep(self):
-        from mle_star_agent.phases.phase1_init.baseline_coder_agent import _INSTRUCTION as baseline_instruction
+    def test_coder_instructions_keep_fp_budget_but_template_uses_recall_calibration(self):
+        # Phase 2 refinement still free-writes scripts, so its INSTRUCTION must
+        # carry the FP-budget contract. Phase 1 candidates are now rendered from
+        # the canonical template, whose threshold policy is recall-targeted
+        # validation calibration.
         from mle_star_agent.phases.phase2_refinement.refinement_coder_agent import _INSTRUCTION as refinement_instruction
+        from mle_star_agent.shared.script_template import get_script_template
 
-        for instruction in (baseline_instruction, refinement_instruction):
-            self.assertIn("FP <= 2", instruction)
-            self.assertIn("filter out thresholds", instruction)
+        self.assertIn("FP <= 2", refinement_instruction)
+        self.assertIn("filter out thresholds", refinement_instruction)
+
+        template = get_script_template(data_split_path="checkpoints/data_split_grouped.json")
+        self.assertIn("VAL_NG_RECALL_TARGET", template)
+        self.assertIn("recall_candidates = [c for c in all_candidates if c['recall'] >= VAL_NG_RECALL_TARGET]", template)
+        self.assertIn("best_threshold = min(recall_candidates, key=lambda c: c['threshold'])['threshold']", template)
 
     def test_refinement_instruction_requires_dynamic_fp_penalty_when_overkill_is_high(self):
         from mle_star_agent.phases.phase2_refinement.refinement_coder_agent import _INSTRUCTION
@@ -1404,7 +1429,12 @@ print(f"METRICS: {{'roc_auc': {roc_auc}, 'prob_gap': {prob_gap}}}")
                 "overkill_rate": 0.88,
                 "f1": 0.65,
                 "roc_auc": 0.59,
-                "prob_gap": 0.02,
+                # prob_gap must be at/below the separability floor
+                # (config.PROBE_PROBABILITY_GAP_MIN = 0.01) to count as a true
+                # collapse; values above it are intentionally left to train (see
+                # the "let borderline cases train" config note), so 0.02 correctly
+                # classifies as low_capacity_miss, not full_freeze_underfit.
+                "prob_gap": 0.005,
             },
             calibration_stats={"G_prob_mean": 0.48, "NG_prob_mean": 0.50},
         )
@@ -1648,8 +1678,11 @@ PREDICTIONS: [
                 })
                 self.actions = type("Actions", (), {"escalate": False})()
 
+        # Catastrophic probe: overkill 0.95 exceeds PROBE_OVERKILL_REJECT_MAX (0.90,
+        # loosened to "reject only ConvNeXt-style >=90% overkill"). A 0.70 probe is
+        # now intentionally allowed to train, so it must be >0.90 to be rejected.
         stdout = (
-            'PROBE_METRICS: {"ng_recall": 0.96, "overkill_rate": 0.70, '
+            'PROBE_METRICS: {"ng_recall": 0.96, "overkill_rate": 0.95, '
             '"G_prob_mean": 0.48, "NG_prob_mean": 0.50}\n'
         )
 
@@ -1668,11 +1701,14 @@ PREDICTIONS: [
                 message = module.evaluate_and_update_fn(context)
 
                 self.assertIn("PROBE_REJECTED", message)
-                self.assertEqual(context.state["no_improve_count"], 1)
-                self.assertEqual(context.state["latest_probe_metrics"]["overkill_rate"], 0.70)
+                # A rejected probe is a generation failure (script never trained), so it
+                # bumps generation_fail_count; no_improve only ticks after GENERATION_FAIL_MAX.
+                self.assertEqual(context.state["generation_fail_count"], 1)
+                self.assertEqual(context.state["no_improve_count"], 0)
+                self.assertEqual(context.state["latest_probe_metrics"]["overkill_rate"], 0.95)
                 saved = json.loads((checkpoint_dir / "refinement_0_0.json").read_text())
                 self.assertEqual(saved["failure_reason"], "probe_rejected")
-                self.assertEqual(saved["probe_metrics"]["overkill_rate"], 0.70)
+                self.assertEqual(saved["probe_metrics"]["overkill_rate"], 0.95)
 
 
 class ErrorAnalysisAgentWorkflowTests(unittest.TestCase):
@@ -1734,12 +1770,16 @@ class ErrorAnalysisAgentWorkflowTests(unittest.TestCase):
             refinement_planner_agent,
             strategy_gate_agent,
         )
+        from mle_star_agent.phases.phase2_refinement.reflexion_agent import reflexion_agent
         from mle_star_agent.phases.phase2_refinement.refinement_coder_agent import refinement_coder_agent
 
         names = [agent.name for agent in inner_loop_agent.sub_agents]
 
-        self.assertEqual(names[:4], [
+        # reflexion_agent (commit 5967065) runs after the gate and before planning,
+        # so it sits at index 1 in the inner-loop chain.
+        self.assertEqual(names[:5], [
             error_analysis_gate_agent.name,
+            reflexion_agent.name,
             refinement_planner_agent.name,
             strategy_gate_agent.name,
             refinement_coder_agent.name,

@@ -4,12 +4,17 @@ from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
 
 from mle_star_agent import config
-from mle_star_agent.shared.callbacks import count_tokens_callback, rate_limit_retry_callback
+from mle_star_agent.shared.callbacks import (
+    _make_bypass_response,
+    count_tokens_callback,
+    rate_limit_retry_callback,
+)
 from mle_star_agent.shared.checkpoint_io import (
     checkpoint_exists,
     load_checkpoint,
     save_checkpoint,
 )
+from mle_star_agent.shared import metric_guard
 from mle_star_agent.shared.selection_metrics import (
     AVERAGED_EVALUATION_KEY,
     select_best_record,
@@ -56,7 +61,21 @@ def _select_best_successful_candidate(scores: list[dict]) -> dict | None:
         s for s in scores
         if s.get("status") == "success" and s.get("metrics") is not None
     ]
-    best = select_best_record(successful)
+    valid = []
+    for candidate in successful:
+        metrics = selection_metrics_for_record(candidate)
+        try:
+            ng_recall = float(metrics.get("ng_recall", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            ng_recall = 0.0
+        if ng_recall <= 0.0:
+            continue
+        if metric_guard.is_degenerate_solution(metrics):
+            continue
+        if metric_guard.has_corner_threshold(metrics):
+            continue
+        valid.append(candidate)
+    best = select_best_record(valid)
     if best is None:
         return None
 
@@ -175,18 +194,17 @@ def initialize_phase2_fn(tool_context) -> str:
             best_candidate_name, l0_score, l0_overkill,
         )
     else:
-        # No successful candidates — fall back to first available script
-        logger.warning("No successful candidates found; using first available script as L0.")
-        fallback = next((s for s in scripts if s.get("script")), None)
-        if fallback is None:
-            return "ERROR: no valid candidate script found in state['candidate_scripts']."
-        best_candidate_name = fallback.get("name", "candidate_0")
-        l0_score    = 0.0
-        l0_overkill = 1.0
-        l0_miss_rate = 1.0
-        l0_script   = fallback["script"]
-        selection_metrics = {}
-        best = {}
+        tool_context.state["stop_outer_loop"] = True
+        tool_context.state["phase1_stop_reason"] = "no_valid_phase1_candidate"
+        logger.error(
+            "No valid Phase 1 candidates found; refusing to initialize Phase 2."
+        )
+        return (
+            "NO_VALID_PHASE1_CANDIDATE: all Phase 1 candidates failed, produced "
+            "L0_score=0.0, selected forbidden corner thresholds, or collapsed to "
+            "degenerate all-G/all-NG outputs. Refusing to write L0.json or "
+            "phase2_init.json; regenerate Phase 1 candidates or stop for a new strategy."
+        )
 
     if not l0_script:
         return f"ERROR: script for candidate '{best_candidate_name}' is empty."
@@ -261,6 +279,18 @@ def initialize_phase2_fn(tool_context) -> str:
 _check_load_tool = FunctionTool(func=check_and_load_phase2_init_fn)
 _init_phase2_tool = FunctionTool(func=initialize_phase2_fn)
 
+
+def _bypass_merger(callback_context, llm_request):
+    try:
+        result1 = check_and_load_phase2_init_fn(callback_context)
+        if result1.startswith("CHECKPOINT_FOUND"):
+            return _make_bypass_response(result1)
+        result2 = initialize_phase2_fn(callback_context)
+        return _make_bypass_response(f"{result1}\n\n{result2}")
+    except Exception as exc:
+        logger.warning("bypass_merger: exception — falling back to LLM: %s", exc)
+        return None
+
 # ---------------------------------------------------------------------------
 # Merger agent instruction
 # ---------------------------------------------------------------------------
@@ -306,6 +336,7 @@ merger_agent = LlmAgent(
     instruction=_INSTRUCTION,
     tools=[_check_load_tool, _init_phase2_tool],
     include_contents="none",
+    before_model_callback=_bypass_merger,
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )

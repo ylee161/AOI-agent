@@ -31,6 +31,9 @@ MIN_NG_COUNT = 5             # too few NG to estimate miss_rate / AUC honestly
 MIN_G_COUNT = 5              # too few G to estimate overkill / AUC honestly
 PROB_GAP_EPS = 1e-9          # prob_gap at/below this == no separability signal
 SCORE_IDENTICAL_STD_EPS = 1e-6  # std of predicted scores below this == flat
+DEGENERATE_RATE_EPS = 1e-9
+CORNER_THRESHOLD_EPS = 1e-9
+NO_SIGNAL_ROC_AUC_MAX = 0.55
 
 # Verification modes that are allowed to run fast / on a subsample. These only
 # waive the RUNTIME check — a run that is degenerate by separability
@@ -78,6 +81,28 @@ def scores_effectively_identical(scores: Optional[Sequence[float]]) -> bool:
     return (hi - lo) <= SCORE_IDENTICAL_STD_EPS
 
 
+def is_degenerate_solution(metrics: Any) -> bool:
+    """True for all-G/all-NG operating points that solve the metric by collapse."""
+    ng_recall = _get(metrics, "ng_recall", 0.0)
+    miss_rate = _get(metrics, "miss_rate", 1.0)
+    overkill = _get(metrics, "overkill_rate", 1.0)
+    all_g = overkill <= DEGENERATE_RATE_EPS and ng_recall <= DEGENERATE_RATE_EPS
+    all_ng = miss_rate <= DEGENERATE_RATE_EPS and overkill >= 1.0 - DEGENERATE_RATE_EPS
+    return all_g or all_ng
+
+
+def has_corner_threshold(metrics: Any) -> bool:
+    """True when the selected threshold is exactly the sweep corner 0.0 or 1.0."""
+    threshold = _get(metrics, "threshold", 0.5)
+    return threshold <= CORNER_THRESHOLD_EPS or threshold >= 1.0 - CORNER_THRESHOLD_EPS
+
+
+def is_no_signal_metrics(metrics: Any) -> bool:
+    """True when a real reported held-out ROC-AUC is chance-level."""
+    roc_auc = _get(metrics, "roc_auc", 0.0)
+    return 0.0 < roc_auc <= NO_SIGNAL_ROC_AUC_MAX
+
+
 def degenerate_rejection_reason(
     metrics: Any,
     duration_ms: Optional[float] = None,
@@ -119,6 +144,15 @@ def degenerate_rejection_reason(
 
     if scores_effectively_identical(scores):
         return "all predicted scores effectively identical (degenerate AUC)"
+
+    if is_degenerate_solution(metrics):
+        return (
+            "degenerate all-G/all-NG operating point "
+            "(recall/overkill collapsed to a corner solution)"
+        )
+
+    if has_corner_threshold(metrics):
+        return "threshold is a forbidden corner value (0.0/1.0)"
 
     return None
 

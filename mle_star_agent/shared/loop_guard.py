@@ -52,6 +52,27 @@ def should_restart_inner_for_stagnation(state: dict) -> bool:
     return no_improve >= config.INNER_STAGNATION_MAX_UNCONSTRAINED
 
 
+def should_stop_when_no_acceptable_path_remains(state: dict) -> bool:
+    """Stop instead of restarting when current ablation evidence has no acceptable path."""
+    no_improve = int(state.get("no_improve_count", 0) or 0)
+    if no_improve < config.INNER_STAGNATION_MAX_UNCONSTRAINED:
+        return False
+    if passes_relaxed_acceptance(best_metrics_from_state(state)):
+        return False
+
+    ablation_results = state.get("ablation_results") or []
+    if not ablation_results:
+        return False
+
+    for result in ablation_results:
+        if not isinstance(result, dict) or result.get("status") != "success":
+            continue
+        metrics = result.get("metrics") or {}
+        if passes_relaxed_acceptance(metrics):
+            return False
+    return True
+
+
 def should_restart_for_high_overkill(state: dict) -> bool:
     """
     Restart outer diagnosis when overkill is catastrophically high (>= 0.50) and

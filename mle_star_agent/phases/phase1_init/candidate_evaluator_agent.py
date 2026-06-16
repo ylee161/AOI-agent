@@ -26,7 +26,11 @@ from mle_star_agent.guards.code_validator_agent import (
     store_validation_cache_tool,
 )
 from mle_star_agent.shared import code_runner, metric_guard
-from mle_star_agent.shared.callbacks import count_tokens_callback, rate_limit_retry_callback
+from mle_star_agent.shared.callbacks import (
+    _make_bypass_response,
+    count_tokens_callback,
+    rate_limit_retry_callback,
+)
 from mle_star_agent.shared.checkpoint_io import (
     checkpoint_exists,
     load_checkpoint,
@@ -223,6 +227,72 @@ def _make_run_slot_fn(slot_index: int):
         script_name = candidate.get("name", f"candidate_{slot_index}")
         architecture = candidate.get("architecture", "")
 
+        # Static stub guard: a real candidate is a rendered template (hundreds of
+        # lines, defines build_model). Anything shorter is a stub/truncated script
+        # whose printed METRICS would be meaningless — fail it without running.
+        script_lines = len(script_text.strip().splitlines())
+        if script_lines < 50 or "def build_model" not in script_text:
+            result_dict = {
+                "slot": slot_index,
+                "name": script_name,
+                "architecture": architecture,
+                "returncode": None,
+                "timed_out": False,
+                "duration_ms": 0.0,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "metrics": None,
+                AVERAGED_EVALUATION_KEY: None,
+                "status": "failed",
+                "smoke_metrics": None,
+                "smoke_score": None,
+                "smoke_diagnostics": None,
+                "full_run_executed": False,
+                "full_run_reason": "stub_or_truncated_script",
+            }
+            tool_context.state[f"candidate_result_{slot_index}"] = result_dict
+            return (
+                f"Slot {slot_index} ({script_name}): REJECTED without running — "
+                f"script is a stub or truncated ({script_lines} lines, "
+                f"build_model {'present' if 'def build_model' in script_text else 'missing'})."
+            )
+
+        # Prefetch pass: build the model once with a network-friendly timeout so
+        # pretrained-weight downloads are cached BEFORE the time-capped smoke run.
+        # (DINOv2-B previously "failed" Phase 1 because its 330 MB download alone
+        # exceeded the smoke cap — and then got permanently banned.)
+        if "AOI_PREFETCH_ONLY" in script_text:
+            prefetch_result = code_runner.run_script(
+                script_text,
+                timeout=getattr(config, "PREFETCH_TIMEOUT_SECONDS", 1800),
+                env={**_seed_env(42), "AOI_PREFETCH_ONLY": "1"},
+            )
+            if prefetch_result.returncode != 0:
+                result_dict = {
+                    "slot": slot_index,
+                    "name": script_name,
+                    "architecture": architecture,
+                    "returncode": prefetch_result.returncode,
+                    "timed_out": prefetch_result.timed_out,
+                    "duration_ms": round(prefetch_result.duration_ms, 1),
+                    "stdout_tail": prefetch_result.stdout[-3000:],
+                    "stderr_tail": prefetch_result.stderr[-1000:],
+                    "metrics": None,
+                    AVERAGED_EVALUATION_KEY: None,
+                    "status": "failed",
+                    "smoke_metrics": None,
+                    "smoke_score": None,
+                    "smoke_diagnostics": None,
+                    "full_run_executed": False,
+                    "full_run_reason": "prefetch_failed",
+                }
+                tool_context.state[f"candidate_result_{slot_index}"] = result_dict
+                return (
+                    f"Slot {slot_index} ({script_name}): FAILED in prefetch pass "
+                    f"(rc={prefetch_result.returncode}, timed_out={prefetch_result.timed_out}) — "
+                    f"model could not even be built. stderr: {prefetch_result.stderr[-300:]}"
+                )
+
         logger.info("Smoke-running candidate slot %d: %s", slot_index, script_name)
         smoke_result = code_runner.run_script(
             script_text,
@@ -349,6 +419,16 @@ Call `check_candidate_scores_checkpoint_fn` immediately.
 Do not call any other tools.
 """
 
+
+def _bypass_candidate_gate(callback_context, llm_request):
+    try:
+        result = check_candidate_scores_checkpoint_fn(callback_context)
+        return _make_bypass_response(result)
+    except Exception as exc:
+        logger.warning("bypass_candidate_gate: exception — falling back to LLM: %s", exc)
+        return None
+
+
 candidate_checkpoint_gate = LlmAgent(
     name="candidate_checkpoint_gate",
     model=config.MODEL,
@@ -356,6 +436,7 @@ candidate_checkpoint_gate = LlmAgent(
     instruction=_GATE_INSTRUCTION,
     tools=[_checkpoint_gate_tool],
     include_contents="none",
+    before_model_callback=_bypass_candidate_gate,
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )
@@ -412,6 +493,10 @@ def consolidate_candidate_scores_fn(tool_context) -> str:
     new_failures = []
     for s in scores:
         if s.get("status") in _PHASE1_FAILURE_STATUSES:
+            # Timeouts are an infrastructure/budget failure, not evidence the
+            # architecture itself is bad — do NOT ban those permanently.
+            if s.get("timed_out"):
+                continue
             name = (s.get("name") or "").strip()
             arch = (s.get("architecture") or "").strip()
             if name or arch:
@@ -561,6 +646,15 @@ Steps:
 Do not write any new state keys — `consolidate_candidate_scores_fn` handles all state writes.
 """
 
+def _bypass_candidate_agg(callback_context, llm_request):
+    try:
+        result = consolidate_candidate_scores_fn(callback_context)
+        return _make_bypass_response(result)
+    except Exception as exc:
+        logger.warning("bypass_candidate_agg: exception — falling back to LLM: %s", exc)
+        return None
+
+
 candidate_aggregator_agent = LlmAgent(
     name="candidate_aggregator_agent",
     model=config.MODEL_PRO,
@@ -568,6 +662,7 @@ candidate_aggregator_agent = LlmAgent(
     instruction=_AGGREGATOR_INSTRUCTION,
     tools=[_consolidate_tool],
     include_contents="none",
+    before_model_callback=_bypass_candidate_agg,
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )

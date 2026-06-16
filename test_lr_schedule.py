@@ -7,17 +7,21 @@ os.environ.setdefault("DEEPSEEK_API_KEY", "test-key")
 
 class LrSchedulePromptTests(unittest.TestCase):
     def test_baseline_recipe_requires_lr_schedule_without_changing_epoch_contract(self):
+        # Phase 1 candidates are rendered from the canonical template, which owns
+        # the epoch contract and the scheduler stepping; the coder instruction
+        # only has to demand a real schedule from build_scheduler().
         baseline_coder_agent = importlib.import_module(
             "mle_star_agent.phases.phase1_init.baseline_coder_agent"
         )
+        from mle_star_agent.shared.script_template import get_script_template
 
         instruction = baseline_coder_agent._INSTRUCTION
-
-        self.assertIn("epochs = DRY_RUN_EPOCHS if DRY_RUN else 20", instruction)
-        self.assertIn("learning-rate schedule", instruction)
+        self.assertIn("REAL LR schedule", instruction)
         self.assertIn("CosineAnnealingWarmRestarts", instruction)
-        self.assertIn("ReduceLROnPlateau", instruction)
-        self.assertIn("scheduler.step()", instruction)
+
+        template = get_script_template(data_split_path="checkpoints/data_split_grouped.json")
+        self.assertIn("epochs          = DRY_RUN_EPOCHS if DRY_RUN else 20", template)
+        self.assertIn("scheduler.step()", template)
 
     def test_refinement_recipe_requires_lr_schedule_when_refining_scripts(self):
         refinement_coder_agent = importlib.import_module(

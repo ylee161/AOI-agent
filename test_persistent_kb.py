@@ -142,8 +142,17 @@ class EvaluatorWritesQuadrupleTests(unittest.TestCase):
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 eval_ctx = FakeContext({
                     # A non-empty previous best so the diff is a real unified diff.
-                    "best_pipeline_script": "print('OLD pipeline')\n# old body\nx = 1\n",
-                    "current_script": "print('NEW candidate pipeline')\n# new body\nx = 2\n",
+                    # Both scripts are padded to >=10 lines (identical trailing context)
+                    # so they clear the stub-script KB-write guard while the head lines
+                    # still drive the asserted unified diff.
+                    "best_pipeline_script": (
+                        "print('OLD pipeline')\n# old body\nx = 1\n"
+                        + "".join(f"shared_ctx_{i} = {i}\n" for i in range(10))
+                    ),
+                    "current_script": (
+                        "print('NEW candidate pipeline')\n# new body\nx = 2\n"
+                        + "".join(f"shared_ctx_{i} = {i}\n" for i in range(10))
+                    ),
                     "outer_iteration": 0,
                     "inner_iteration": 0,
                     "current_best_score": 0.0,
@@ -223,8 +232,15 @@ class EvaluatorWritesQuadrupleTests(unittest.TestCase):
                 ),
             ):
                 eval_ctx = FakeContext({
-                    "best_pipeline_script": "print('OLD pipeline')\n",
-                    "current_script": "print('NEW candidate pipeline')\n",
+                    # >=10 lines each so they clear the stub-script KB-write guard.
+                    "best_pipeline_script": (
+                        "print('OLD pipeline')\n"
+                        + "".join(f"shared_ctx_{i} = {i}\n" for i in range(10))
+                    ),
+                    "current_script": (
+                        "print('NEW candidate pipeline')\n"
+                        + "".join(f"shared_ctx_{i} = {i}\n" for i in range(10))
+                    ),
                     "outer_iteration": 2,
                     "inner_iteration": 3,
                     "current_best_score": 0.0,

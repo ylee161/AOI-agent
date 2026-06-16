@@ -57,23 +57,66 @@ _EPOCH_ASSIGN_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Match `DataLoader(` followed by an optional `dataset=` keyword and the first
-# dataset identifier, so we can wrap that identifier in the 5% cap helper.
-_DATALOADER_RE = re.compile(
-    r"(\bDataLoader\s*\(\s*)(dataset\s*=\s*)?([A-Za-z_][\w.]*)",
-)
+# Match the start of a `DataLoader(` call and an optional `dataset=` keyword.
+# The first ARGUMENT (not just the first identifier) is then scanned with paren
+# counting in `_wrap_dataloader_datasets` so inline constructors like
+# `DataLoader(StereoDataset(samples, augment=True), ...)` wrap correctly. The
+# old identifier-only regex produced `__aoi_cap5(StereoDataset)(...)` — wrapping
+# the CLASS, where the helper's len() raised and silently no-opped, so the 5%
+# smoke cap never actually applied to template-style scripts.
+_DATALOADER_OPEN_RE = re.compile(r"\bDataLoader\s*\(")
+_DATASET_KW_RE = re.compile(r"dataset\s*=\s*")
 
-# Prepended to every debug-mode script. Subsets a dataset to 5% of its samples;
-# degrades to a no-op for anything that is not a sized torch dataset.
+
+def _wrap_dataloader_datasets(script: str) -> str:
+    """Wrap the first argument of every DataLoader(...) call in __aoi_cap5(...)."""
+    pieces = []
+    last = 0
+    for match in _DATALOADER_OPEN_RE.finditer(script):
+        arg_start = match.end()
+        while arg_start < len(script) and script[arg_start] in " \t\n":
+            arg_start += 1
+        kw = _DATASET_KW_RE.match(script, arg_start)
+        if kw:
+            arg_start = kw.end()
+        if arg_start < last:
+            continue  # nested DataLoader inside an already-wrapped argument
+        depth = 0
+        arg_end = arg_start
+        while arg_end < len(script):
+            char = script[arg_end]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif char == "," and depth == 0:
+                break
+            arg_end += 1
+        pieces.append(script[last:arg_start])
+        pieces.append("__aoi_cap5(" + script[arg_start:arg_end] + ")")
+        last = arg_end
+    pieces.append(script[last:])
+    return "".join(pieces)
+
+# Prepended to every debug-mode script. Subsets a dataset to 5% of its samples
+# (floor 16, so tiny datasets still yield metric-bearing smoke runs) using a
+# STRIDED index — sample files are ordered by lot/board, so taking the first k
+# could return a single class/lot and make every smoke metric meaningless.
+# Degrades to a no-op for anything that is not a sized torch dataset.
+_DEBUG_CAP_MIN_SAMPLES = 16
 _DEBUG_CAP_HELPER = (
     "def __aoi_cap5(__ds):\n"
     "    try:\n"
     "        import torch.utils.data as __tud\n"
     "        __n = len(__ds)\n"
-    "        __k = max(1, int(__n * 0.05))\n"
+    f"        __k = min(__n, max({_DEBUG_CAP_MIN_SAMPLES}, int(__n * 0.05)))\n"
     "        if __k >= __n:\n"
     "            return __ds\n"
-    "        return __tud.Subset(__ds, list(range(__k)))\n"
+    "        __step = max(1, __n // __k)\n"
+    "        __idx = list(range(0, __n, __step))[:__k]\n"
+    "        return __tud.Subset(__ds, __idx)\n"
     "    except Exception:\n"
     "        return __ds\n"
 )
@@ -88,10 +131,7 @@ def apply_debug_patches(script: str) -> str:
     epoch_cap = str(int(config.CURVE_ABORT_DEBUG_EPOCHS))
     patched = _EPOCH_TERNARY_RE.sub(lambda m: m.group(1) + epoch_cap, script)
     patched = _EPOCH_ASSIGN_RE.sub(lambda m: m.group(1) + epoch_cap, patched)
-    patched = _DATALOADER_RE.sub(
-        lambda m: m.group(1) + (m.group(2) or "") + "__aoi_cap5(" + m.group(3) + ")",
-        patched,
-    )
+    patched = _wrap_dataloader_datasets(patched)
     return _DEBUG_CAP_HELPER + "\n" + patched
 
 

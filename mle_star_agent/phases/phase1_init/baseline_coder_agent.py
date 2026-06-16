@@ -1,10 +1,11 @@
+import ast
 import logging
+import re
 
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
 
 from mle_star_agent import config
-from mle_star_agent.guards.code_validator_agent import code_validator_tool, store_validation_cache_tool
 from mle_star_agent.shared.callbacks import count_tokens_callback, rate_limit_retry_callback
 from mle_star_agent.shared.checkpoint_io import (
     checkpoint_exists,
@@ -25,27 +26,36 @@ def ensure_data_split_fn(tool_context) -> str:
         data = load_checkpoint(config.CKPT_DATA_SPLIT)
         tool_context.state["data_split"] = data
         modality = data.get("metadata", {}).get("input_modality", "stereo")
+        granularity = data.get("metadata", {}).get("label_granularity", "board")
         tool_context.state["input_modality"] = modality
+        tool_context.state["label_granularity"] = granularity
         stats = data.get("stats", {})
         return (
             f"Data split loaded from checkpoint: "
             f"train={stats.get('train_size')}, val={stats.get('val_size')}, test={stats.get('test_size')} "
             f"(NG={stats.get('ng_count')}, G={stats.get('g_count')}, total={stats.get('total')})"
-            f" | input_modality={modality}"
+            f" | input_modality={modality} | label_granularity={granularity}"
         )
 
-    logger.info("Building data split from %d lot folders...", len(config.DATASET_FOLDERS))
-    data = build_data_split(config.DATASET_FOLDERS)
+    granularity = getattr(config, "LABEL_GRANULARITY", "board")
+    split_strategy = getattr(config, "SPLIT_STRATEGY", "grouped")
+    logger.info(
+        "Building data split from %d lot folders (label_granularity=%s, split_strategy=%s)...",
+        len(config.DATASET_FOLDERS), granularity, split_strategy,
+    )
+    data = build_data_split(config.DATASET_FOLDERS, label_granularity=granularity, split_strategy=split_strategy)
     save_checkpoint(config.CKPT_DATA_SPLIT, data)
     tool_context.state["data_split"] = data
     modality = data["metadata"]["input_modality"]
+    granularity = data["metadata"].get("label_granularity", "board")
     tool_context.state["input_modality"] = modality
+    tool_context.state["label_granularity"] = granularity
     stats = data.get("stats", {})
     return (
         f"Data split created and saved: "
         f"train={stats.get('train_size')}, val={stats.get('val_size')}, test={stats.get('test_size')} "
         f"(NG={stats.get('ng_count')}, G={stats.get('g_count')}, total={stats.get('total')})"
-        f" | input_modality={modality}"
+        f" | input_modality={modality} | label_granularity={granularity}"
     )
 
 
@@ -103,6 +113,82 @@ def append_candidate_script_fn(tool_context, name: str, script: str, architectur
     save_checkpoint(config.CKPT_CANDIDATE_SCRIPTS, {"scripts": existing})
     tool_context.state["candidate_scripts"] = existing
     return f"Saved script '{name}' ({len(existing)}/3 scripts saved to checkpoint)."
+
+
+# ---------------------------------------------------------------------------
+# Render-from-block path: the LLM authors ONLY the architecture block; the rest
+# of the script is the canonical template byte-for-byte. This kills the entire
+# free-write drift class (wrong device line, over-strict probe gates, broken
+# training loops) that historically produced most Phase 1 failures.
+# ---------------------------------------------------------------------------
+
+_BLOCK_MARKER_RE = re.compile(r"#\s*<<<\s*ARCHITECTURE BLOCK (START|END)\s*>>>")
+
+# Names the template assigns AFTER the block — a block-level assignment to any
+# of them either crashes (model not built yet) or silently corrupts the run.
+_BLOCK_FORBIDDEN_TOPLEVEL = {
+    "model", "optimizer", "scheduler", "criterion", "device",
+    "train_loader", "val_loader", "test_loader", "epochs",
+}
+
+
+def _architecture_block_problems(block: str) -> list:
+    """Static checks on an LLM-authored architecture block. Empty list = OK."""
+    problems = []
+    if "def build_model" not in block:
+        problems.append("block must define `def build_model()` returning the model on `device`")
+    try:
+        tree = ast.parse(block)
+    except SyntaxError as exc:
+        return [f"block has a syntax error: {exc}"]
+    for node in tree.body:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in _BLOCK_FORBIDDEN_TOPLEVEL:
+                problems.append(
+                    f"block must not assign `{target.id}` at top level — the template builds it "
+                    "after the block; define build_model/build_optimizer/build_scheduler functions instead"
+                )
+    return problems
+
+
+def append_candidate_block_fn(tool_context, name: str, architecture_block: str, architecture: str) -> str:
+    """Render a complete candidate script from the canonical template plus this
+    architecture block, syntax-check it, mark it pre-validated, and save it."""
+    from mle_star_agent.guards.code_validator_agent import store_validation_cache_fn
+    from mle_star_agent.shared.script_template import get_script_template
+
+    block = _BLOCK_MARKER_RE.sub("", architecture_block or "").strip()
+    if not block:
+        return "BLOCK_REJECTED: architecture_block is empty."
+    problems = _architecture_block_problems(block)
+    if problems:
+        return "BLOCK_REJECTED: " + "; ".join(problems) + ". Fix the block and call this tool again."
+    if "PROBE_EPOCHS" not in block:
+        block += "\n\nPROBE_EPOCHS = min(DRY_RUN_EPOCHS, 5) if DRY_RUN else 5"
+
+    modality = tool_context.state.get("input_modality", "stereo")
+    granularity = tool_context.state.get("label_granularity", "board")
+    data_split_ckpt = getattr(config, "CKPT_DATA_SPLIT", config.CHECKPOINT_DIR / "data_split_grouped.json")
+    script = get_script_template(
+        data_split_path=str(data_split_ckpt),
+        input_modality=modality,
+        architecture_block=block,
+        label_granularity=granularity,
+    ).replace("__ARCHITECTURE_NAME__", architecture)
+    try:
+        compile(script, f"<candidate:{name}>", "exec")
+    except SyntaxError as exc:
+        return f"BLOCK_REJECTED: rendered script does not compile ({exc}). Fix the block and call this tool again."
+
+    # The non-block body is the canonical template, so the script is pre-validated:
+    # the slot evaluator's cache check will skip a redundant LLM validation pass.
+    store_validation_cache_fn(tool_context, script, "VALIDATED")
+    return append_candidate_script_fn(tool_context, name, script, architecture)
 
 
 def _modality_loading_pattern(modality: str) -> str:
@@ -173,43 +259,24 @@ def load_retrieved_candidates_fn(tool_context) -> str:
     )
 
 
-def get_script_template_fn(tool_context) -> str:
-    """Return the mandatory script template. The LLM fills ONLY the architecture block."""
-    from mle_star_agent.shared.script_template import get_script_template
-
-    modality = tool_context.state.get('input_modality', 'stereo')
-    # Fallback supports older configs that predate the grouped split checkpoint attr.
-    data_split_ckpt = getattr(config, 'CKPT_DATA_SPLIT', config.CHECKPOINT_DIR / 'data_split_grouped.json')
-    data_split_path = str(data_split_ckpt)
-    template = get_script_template(data_split_path=data_split_path, input_modality=modality)
-    tool_context.state['script_template'] = template
-    return (
-        'TEMPLATE_LOADED: The script template is now in state["script_template"]. '
-        'You must fill ONLY the section between "<<< ARCHITECTURE BLOCK START >>>" and '
-        '"<<< ARCHITECTURE BLOCK END >>>". Do NOT modify anything outside that block. '
-        'The template already handles: data loading, pos_weight (n_g/n_ng), probe logic, '
-        'training loop, isotonic calibration, threshold sweep, and all METRICS output.'
-    )
-
-
 _ensure_data_split_tool = FunctionTool(func=ensure_data_split_fn)
 _load_candidate_scripts_tool = FunctionTool(func=load_candidate_scripts_fn)
-_append_candidate_script_tool = FunctionTool(func=append_candidate_script_fn)
+_append_candidate_block_tool = FunctionTool(func=append_candidate_block_fn)
 _load_retrieved_candidates_tool = FunctionTool(func=load_retrieved_candidates_fn)
-_get_script_template_tool = FunctionTool(func=get_script_template_fn)
 
 # ---------------------------------------------------------------------------
 # Agent instruction
 # ---------------------------------------------------------------------------
 
-_DATA_SPLIT_CHECKPOINT = str(config.CKPT_DATA_SPLIT)
-_THRESHOLD_MIN = config.THRESHOLD_MIN
-_THRESHOLD_MAX = config.THRESHOLD_MAX
-_THRESHOLD_STEP = config.THRESHOLD_STEP
+_INSTRUCTION = """You are the Baseline Coder Agent in the MLE-STAR AOI inspection pipeline.
 
-_INSTRUCTION = f"""You are the Baseline Coder Agent in the MLE-STAR AOI inspection pipeline.
-
-Your role: perform data split setup, then generate 3 diverse candidate training scripts for binary AOI (G/NG) classification on stereo image pairs.
+Your role: perform data split setup, then author 3 diverse candidate ARCHITECTURE BLOCKS for
+binary AOI (G/NG) classification on stereo image pairs. You never write a full training
+script — `append_candidate_block_fn` renders your block into the canonical template, which
+already handles data loading, device selection (CUDA/MPS/CPU), pos_weight, the pre-training
+probe, the training loop, isotonic calibration, the threshold sweep, and all diagnostic
+output (METRICS / EPOCH_LOG / PROBE_METRICS / CALIBRATION_STATS / THRESHOLD_CURVE /
+PREDICTIONS / ERROR_ANALYSIS).
 
 ---
 ## STEP 1 — Ensure data split
@@ -225,146 +292,75 @@ Call `load_candidate_scripts_fn`.
 - If it returns "CHECKPOINT_NOT_FOUND": proceed to STEP 3 and generate all 3.
 
 ---
-## STEP 3 — Generate 3 candidate training scripts
-
-**FIRST call `get_script_template_fn` to load the mandatory template.**
-You will fill ONLY the architecture block — everything else is pre-written and correct.
-Do NOT rewrite the data loading, pos_weight, probe, training loop, threshold sweep, or METRICS sections.
-
-For each candidate architecture, produce ONLY the architecture block content:
-1. Model class definition (or imports + instantiation for pretrained models)
-2. build_model() function that returns model on `device`
-3. Optimizer definition (AdamW recommended, lr=1e-3)
-4. Scheduler definition (CosineAnnealingWarmRestarts(T_0=10, eta_min=1e-6))
-5. PROBE_EPOCHS constant
-
-Then call append_candidate_script_fn with the COMPLETE script (template with your architecture block inserted).
+## STEP 3 — Author 3 candidate ARCHITECTURE BLOCKS
 
 FIRST call `load_retrieved_candidates_fn`. It returns the candidate model menu discovered by
 A_retriever (the retriever agent ran before you and stored 4 candidates in state) plus the
-data-loading pattern for THIS dataset's input modality. Base your scripts on that menu — do
-not use a fixed/hardcoded model list. If the tool reports no retrieved candidates, use your
-best judgement per its fallback note.
+data-loading pattern for THIS dataset's input modality. Pick 3 DISTINCT architectures from
+that menu — do not use a fixed/hardcoded model list. If the tool reports no retrieved
+candidates, use your best judgement for 3 small-data pretrained backbones.
 
-Generate exactly 3 Python scripts. Each script must be completely self-contained — it runs as a standalone process with no ADK state access.
+For each pick, author ONLY the architecture block (a module-level Python fragment), then call
+`append_candidate_block_fn(name, architecture_block, architecture)`. The tool renders the
+full script, syntax-checks it, and saves it. If it returns "BLOCK_REJECTED: ...", fix the
+reported problem and call it again with the corrected block.
 
-### Data access pattern (all scripts must follow this exactly)
+### Block contract — what your fragment must define
+
+1. `def build_model()` — builds the model, moves it to `device` (already defined by the
+   template), and returns it. Pretrained weights are encouraged; downloads are fine (the
+   harness pre-caches them in a separate pass).
+2. `def build_optimizer(model)` — returns the optimizer.
+3. `def build_scheduler(optimizer)` — returns a REAL LR schedule (e.g.
+   `optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, eta_min=1e-6)`).
+4. Optional `def build_criterion()` — defaults to `BCEWithLogitsLoss(pos_weight=...)` if omitted.
+5. `PROBE_EPOCHS = min(DRY_RUN_EPOCHS, 5) if DRY_RUN else 5` (use 8 instead of 5 for
+   feature-diff / ViT candidates — frozen backbones need more warm-up).
+6. For ViT/Siamese candidates only: `FEATURE_DIFF_CANDIDATE = True` (see the mandatory rule below).
+
+Names already in scope for your block: `torch`, `nn`, `optim`, `os`, `device`, `pos_weight`,
+`DRY_RUN`, `DRY_RUN_EPOCHS`, `IMAGE_SIZE`. Single-logit binary output (`nn.Linear(..., 1)`).
+
+NEVER assign `model`, `optimizer`, `scheduler`, `criterion`, `device`, `epochs`, or any
+data loader at the top level of the block — the template builds those after your block, and
+the tool rejects blocks that try.
+
+### Input shape
+
+- Default (9-channel pixel-diff path): the dataset feeds a 9-channel tensor
+  `[L, R, |L-R|]`. Your `build_model()` must adapt the backbone's first conv to 9 input
+  channels with the /3 repeat trick:
+  ```python
+  new_conv = nn.Conv2d(9, old_conv.out_channels, kernel_size=old_conv.kernel_size,
+                       stride=old_conv.stride, padding=old_conv.padding, bias=False)
+  with torch.no_grad():
+      new_conv.weight.copy_(old_conv.weight.repeat(1, 3, 1, 1) / 3.0)
+  ```
+  Do NOT leave channels 4-9 randomly initialised — random stem noise drowns the pretrained
+  signal on this small dataset.
+- Feature-diff path (`FEATURE_DIFF_CANDIDATE = True`): the model's `forward(img_l, img_r)`
+  receives two standard 3-channel images; no first-conv surgery.
+
+### Learning-rate policy (small-data critical — collapse risk)
+
+The train split has only ~200-290 samples. A single lr=1e-3 over a whole pretrained
+backbone destroys the pretrained features and collapses the model to constant output
+(observed repeatedly on this dataset). Use differential parameter groups:
 
 ```python
-import json
-DATA_SPLIT_PATH = "{_DATA_SPLIT_CHECKPOINT}"
-with open(DATA_SPLIT_PATH) as f:
-    data_split = json.load(f)
-
-train_samples = data_split["train"]   # list of sample dicts (img_l+img_r for stereo; img for mono)
-val_samples   = data_split["val"]
-test_samples  = data_split["test"]
+def build_optimizer(model):
+    head_params = [p for n, p in model.named_parameters() if 'fc' in n or 'classifier' in n or 'head' in n]
+    head_ids = {id(p) for p in head_params}
+    backbone_params = [p for p in model.parameters() if id(p) not in head_ids]
+    return optim.AdamW([
+        {'params': head_params,     'lr': 1e-3},   # new layers: fast
+        {'params': backbone_params, 'lr': 1e-4},   # pretrained: 10x slower (or freeze early stages)
+    ], weight_decay=1e-3)
 ```
 
-Each sample dict has: `sample_id` (str), the image path(s) for this dataset's input modality (`img_l` + `img_r` for stereo; `img` for mono — both absolute paths), and `label` ("G" or "NG"). Use the data-loading pattern reported by `load_retrieved_candidates_fn`.
-
-### Mandatory requirements for every script
-
-0. **Dry-run support** (REQUIRED — validation will fail without this): read these env vars at the top of the script and honour them throughout:
-   ```python
-   import os
-   DRY_RUN        = os.getenv("DRY_RUN") == "1"
-   DRY_RUN_EPOCHS = int(os.getenv("DRY_RUN_EPOCHS", "1"))
-   DRY_RUN_SAMPLES = int(os.getenv("DRY_RUN_SAMPLES", "10"))
-   ```
-   - When `DRY_RUN=1`: cap `train_samples`, `val_samples`, `test_samples` to `DRY_RUN_SAMPLES` each (e.g. `train_samples = train_samples[:DRY_RUN_SAMPLES]`), and set `epochs = DRY_RUN_EPOCHS`. The script must still print `METRICS:` on exit — use whatever values come out of the capped run.
-   - When `DRY_RUN` is not set or `"0"`: use all samples and the full epoch count as designed.
-
-1. **Image loading (per input modality)**: Load images using the pattern specified by `load_retrieved_candidates_fn` output (`img_l`+`img_r` for stereo; `img` for mono). For **stereo**: load BOTH `img_l` AND `img_r`, compute `img_diff = torch.abs(img_l_tensor - img_r_tensor)`, and concatenate all three (L, R, diff) to form a **9-channel input** — the difference map directly encodes defect signal (G boards have near-zero abs(L-R), NG boards show localized high-difference regions). For **mono**: load the single `img` as a standard 3-channel input.
-
-   **9-channel first-conv initialisation (stereo path only)**: when adapting a pretrained backbone to accept a 9-channel first conv, initialise the new layer by repeating the pretrained 3-channel weights evenly across all three groups — do NOT leave channels 4–9 randomly initialised, as this creates noisy gradients that drown out the pretrained signal on small datasets:
-   ```python
-   new_conv = nn.Conv2d(9, old_conv.out_channels, kernel_size=old_conv.kernel_size,
-                        stride=old_conv.stride, padding=old_conv.padding,
-                        dilation=old_conv.dilation, groups=old_conv.groups,
-                        padding_mode=old_conv.padding_mode,
-                        bias=old_conv.bias is not None)
-   with torch.no_grad():
-       new_conv.weight.data = old_conv.weight.data.repeat(1, 3, 1, 1) / 3.0
-       if old_conv.bias is not None:
-           new_conv.bias.data = old_conv.bias.data.clone()
-   ```
-   If the backbone has no pretrained first conv (e.g. trained from scratch), initialise normally.
-2. **Binary labels**: G → 0, NG → 1.
-3. **Weighted loss**: compute pos_weight from the ACTUAL class counts in the training split —
-   do NOT use OVERKILL_BUDGET/MISS_BUDGET (empirically proven to produce ng_recall≈0.05 on
-   this dataset vs ng_recall≈0.29 with class-count weighting):
-   ```python
-   n_ng = sum(1 for s in train_samples if s["label"] == "NG")
-   n_g  = sum(1 for s in train_samples if s["label"] == "G")
-   pos_weight = torch.tensor([n_g / n_ng])   # standard class-imbalance correction
-   ```
-   Pass to `BCEWithLogitsLoss(pos_weight=pos_weight.to(device))`; for `CrossEntropyLoss`
-   (multi-class path) set `weight=torch.tensor([1.0, float(pos_weight)]).to(device)` (the
-   weight tensor MUST be moved to `device` or CUDA logits will raise a device-mismatch error).
-4. **Threshold sweep**: after training, sweep threshold from 0.01 to 0.99 inclusive with step 0.01 on the VAL set. Select the operating point with the strict **Stage 0 → 1 → 2** priority below — miss_rate protection (P0) is always resolved before overkill reduction (P2). Do NOT use acceptance-distance averaging or any blended score as the primary objective; the Phase 2 validator (CHECK 2B) hard-rejects that contract:
-
-   ```python
-   MISS_BUDGET     = {config.MISS_RATE_RELAXED_MAX}
-   OVERKILL_BUDGET = {config.OVERKILL_RELAXED_MAX}
-   FP_MAX          = 2   # FP <= 2 is mandatory at the current 30-G val/test scale
-
-   # Collect every threshold's metrics first, then apply the staged selection.
-   all_candidates = []   # each: (threshold, miss_rate, overkill_rate, fp)
-   for threshold in [round(i / 100.0, 2) for i in range(1, 100)]:
-       # ... compute tp/tn/fp/fn, current_miss_rate, current_overkill_rate ...
-       all_candidates.append((threshold, current_miss_rate, current_overkill_rate, current_fp))
-
-   # Stage 0 — filter out thresholds with FP > 2 (FP <= 2 is mandatory).
-   survivors = [c for c in all_candidates if c[3] <= FP_MAX]
-   if survivors:
-       # Stage 1 — minimise miss_rate among the FP<=2 survivors (target <= MISS_BUDGET).
-       min_miss = min(c[1] for c in survivors)
-       stage1   = [c for c in survivors if c[1] == min_miss]
-       # Stage 2 — among ALL thresholds achieving that minimum miss_rate, pick the
-       # one with the lowest overkill_rate (target <= OVERKILL_BUDGET).
-       best_threshold = min(stage1, key=lambda c: c[2])[0]
-   else:
-       # No threshold survives FP <= 2: choose the minimum FP count, then lowest
-       # miss_rate, and report the result as below-target. NEVER silently accept a
-       # min-miss-rate-only point with catastrophic overkill.
-       best_threshold = min(all_candidates, key=lambda c: (c[3], c[1]))[0]
-   ```
-
-   **Do NOT** rank thresholds by an acceptance-distance / blended-gap score: miss_rate (P0) must be fully resolved before overkill (P2), and the FP <= 2 Stage 0 gate above is mandatory — its no-survivor branch (min FP → min miss_rate, reported below-target) is the contract-correct fallback, not a balanced average.
-
-   **Probability calibration before the sweep**: after training, fit `sklearn.isotonic.IsotonicRegression(out_of_bounds="clip")` on the VALIDATION scores (`X = raw_val_ng_scores`, `y = val_true_binary` with 1=NG, 0=G), then map all val/test scores through the fitted calibrator (`cal_probs = iso.transform(raw_scores)`) so every probability is on the calibrated [0,1] scale. Run the Stage 0/1/2 sweep above on these CALIBRATED probabilities (the sweep already steps 0.01, finer than 0.05). The THRESHOLD_CURVE, the final test metrics, and the reported `threshold` MUST all be computed on the calibrated probabilities — never the raw scores. Labels are binary G/NG only (no defect sub-classes), so this is a single global calibrator and a single global threshold.
-5. **METRICS output**: the last thing the script prints to stdout must be exactly:
-   ```
-   METRICS: {{"accuracy": ..., "ng_recall": ..., "miss_rate": ..., "overkill_rate": ..., "f1": ..., "avg_latency_ms": ..., "threshold": ..., "ng_count": ..., "g_count": ..., "tp": ..., "tn": ..., "fp": ..., "fn": ..., "roc_auc": ..., "prob_gap": ...}}
-   ```
-   `threshold` is a single float and MUST be the selected operating point on the CALIBRATED-probability scale (the isotonic calibrator's output), not the raw score scale.
-   Compute all metrics on the **test split** using the best threshold from the val sweep.
-   - `roc_auc`: `sklearn.metrics.roc_auc_score(y_true, ng_probs)` on the test set (y_true=1 for NG, 0 for G). If only one class present in test, emit 0.0.
-   - `prob_gap`: `mean(ng_probs where true_label==NG) - mean(ng_probs where true_label==G)`. Positive = good separation; near 0 or negative = overlap problem.
-6. **No data leakage**: normalisation stats must be computed on train only; threshold must be tuned on val only, never on test.
-7. **Efficient execution**: use GPU if available (`.to(device)`). Full-run `epochs` MUST be set to exactly `20` with early stopping patience `3`. Do NOT hardcode 5 — the line must read exactly `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20`. Dry-run overrides this via `DRY_RUN_EPOCHS`.
-8. **Learning-rate schedule** (MANDATORY): every script MUST use a real PyTorch learning-rate schedule instead of a fixed LR. Prefer either `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)` (SGDR) or `torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)`. Instantiate the scheduler after the optimizer and call `scheduler.step()` correctly in the training loop: for `CosineAnnealingWarmRestarts`, step once per epoch (or batch with fractional epoch); for `ReduceLROnPlateau`, call `scheduler.step(val_loss)` after validation loss is computed. The validator will hard-reject schedule-less scripts.
-
-   **Layer-wise LR (stereo 9-channel path only)**: when the model has a modified 9-channel input conv (initialised via the `/3` repeat above), split the optimizer into two parameter groups — the new stem needs a 10× higher LR than the pretrained backbone because it starts from a scaled-down initialisation:
-   ```python
-   stem_params     = list(new_conv.parameters())
-   backbone_params = [p for p in model.parameters() if not any(p is sp for sp in stem_params)]
-   optimizer = torch.optim.AdamW([
-       {{'params': stem_params,     'lr': BASE_LR}},        # e.g. 1e-3
-       {{'params': backbone_params, 'lr': BASE_LR / 10}},   # e.g. 1e-4
-   ], weight_decay=1e-3)
-   ```
-   `BASE_LR` here is the script's own base learning rate (e.g. `1e-3`); define it once and reuse it. **Ordering matters**: build this optimizer ONLY after (a) `new_conv` has been assigned back into the model (e.g. `model.conv1 = new_conv`) so its params appear in `model.parameters()`, and (b) `model.to(device)` has run — `.to(device)` rebinds parameter identities, so an optimizer created before the device move holds stale references and silently trains nothing.
-   For mono paths or feature-diff Siamese candidates (standard 3-channel convs), a single LR group is correct — do not apply this split there.
-9. **Error handling**: wrap training loop in try/except and print a clear error message if something fails.
-10. **Epoch logging** (MANDATORY): after each epoch print: `EPOCH_LOG: {{"epoch": N, "train_loss": X, "val_loss": X, "val_ng_recall": X, "val_overkill": X}}`
-11. **Pre-training probe** (MANDATORY): before full training, run a cheap probe and print: `PROBE_METRICS: {{"ng_recall": X, "overkill_rate": X, "G_prob_mean": X, "NG_prob_mean": X, "should_continue": true/false, "reason": "..."}}`.
-    - **Probe epoch count**: run **at least 5 probe epochs** when the first conv was modified for 9-channel input (the `/3`-repeat init needs warm-up time before its signal is reliable); run at least 3 probe epochs for standard 3-channel or feature-diff Siamese candidates. Under `DRY_RUN=1` these minimums do NOT apply — cap probe epochs at `min(DRY_RUN_EPOCHS, the-minimum-above)` so a dry run stays cheap.
-    - **Abort conditions** — only set `should_continue: false` when the failure signal is sustained across ALL probe epochs (not just the last one): catastrophic overkill (overkill > 0.9 at threshold 0.5), recall collapse (ng_recall < 0.2 at threshold 0.5), OR no G/NG probability separation (`abs(NG_prob_mean - G_prob_mean) < 0.01`). The last condition catches truly flat models where both classes receive nearly identical scores; do NOT abort on borderline gaps (0.01–0.05) — those models can still develop separation during full training.
-12. **Calibration statistics** (MANDATORY): after training, compute NG probability for every val sample grouped by true label and print: `CALIBRATION_STATS: {{"G_prob_mean": X, "G_prob_std": X, "NG_prob_mean": X, "NG_prob_std": X}}`
-13. **Threshold curve** (MANDATORY): during val sweep print: `THRESHOLD_CURVE: [{{"t": 0.1, "recall": X, "overkill": X, "miss_rate": X, "accuracy": X}}, ...]`
-14. **Per-sample predictions** (MANDATORY): after METRICS print ALL test sample predictions: `PREDICTIONS: [{{"sample_id": "...", "true_label": "G", "predicted_label": "NG", "ng_probability": 0.82, "threshold": 0.35}}, ...]`
+A modified 9-channel first conv counts as a NEW layer (it starts from a scaled-down
+init) — give it the head LR, not the backbone LR. Partial freezing (e.g. freeze
+everything up to the last block) is encouraged on this data size.
 
 ### small-data-safe strategy policy
 
@@ -390,25 +386,6 @@ strategy if predictions are flat or `prob_gap` collapses near zero. If using aug
 geometric transforms must be applied IDENTICALLY to L and R by sampling parameters
 once and applying them to both. Do not use heavy color jitter, random erasing over
 defects, random perspective, or L/R-desynchronizing affine/rotation/crop.
-
-### Metric definitions (implement exactly)
-- TP = true NG predicted NG; TN = true G predicted G; FP = true G predicted NG; FN = true NG predicted G
-- accuracy = (TP+TN)/(TP+TN+FP+FN)
-- ng_recall = TP/(TP+FN)    [if TP+FN==0 → 1.0]
-- miss_rate = FN/(TP+FN)    [if TP+FN==0 → 0.0]
-- overkill_rate = FP/(TN+FP)  [if TN+FP==0 → 0.0]
-- f1 = 2*precision*recall/(precision+recall)  [if zero denominator → 0.0]
-- avg_latency_ms = total inference time on test / len(test_samples) * 1000
-
-### The 3 candidate architectures
-
-Use the retriever's menu returned by `load_retrieved_candidates_fn` (4 candidates discovered
-via web search). Pick 3 DISTINCT architectures from that menu and generate one self-contained
-training script per pick, using each candidate's `example_code` as your starting point and
-adapting it to this task. Do NOT hardcode a fixed model list — the menu is dynamic and may
-differ per dataset. Apply the data-loading pattern that the tool reports for this dataset's
-input modality (stereo → 9-channel L/R/diff; mono → standard 3-channel), and follow every
-mandatory requirement above (loss weighting, threshold sweep, METRICS, diagnostics, dry-run).
 
 ### MANDATORY rule — ViT/transformer models MUST use FEATURE-LEVEL Siamese difference
 
@@ -439,9 +416,9 @@ pixel difference and you must not conflate the two:
   `concat([f_L, f_R, |f_L - f_R|])` — width == 3 × feature_dim. This keeps separate
   per-branch features AND an explicit learned difference signal.
 
-If you generate a feature-diff candidate, you MUST:
-1. Put the marker `FEATURE_DIFF_CANDIDATE = True` near the top of the script so the
-   validator routes it to the structural feature-difference check.
+If you author a feature-diff block, you MUST:
+1. Put the marker `FEATURE_DIFF_CANDIDATE = True` in the block (the template's dataset
+   and batch unpacking switch to the two-image path when it is True).
 2. Use ONE encoder instance for both branches (shared weights), e.g.:
    ```python
    FEATURE_DIFF_CANDIDATE = True  # feature-level Siamese difference (NOT 9-channel pixel diff)
@@ -463,34 +440,19 @@ If you generate a feature-diff candidate, you MUST:
            combined = torch.cat([f_l, f_r, f_diff], dim=1) # concat [f_L, f_R, |f_L-f_R|]
            return self.fc_head(combined).squeeze(1)
    ```
-3. Keep the standard 3-channel stereo transform (this family does NOT use a 9-channel
-   first conv). All other mandatory requirements (loss, threshold sweep, METRICS,
-   diagnostics, seeding, dry-run) are unchanged.
+3. Keep `def build_model()` returning the Siamese module on `device`, plus
+   build_optimizer/build_scheduler and `PROBE_EPOCHS = min(DRY_RUN_EPOCHS, 8) if DRY_RUN else 8`.
 
-This is the only family where `concat([f_L, f_R, |f_L - f_R|])` is required; the
-validator's feature-difference check enforces shared weights + feature-level abs
-difference + 3× concat width whenever the `FEATURE_DIFF_CANDIDATE` marker is present.
-
----
-## STEP 4 — Validate and immediately save each script
-
-For EACH generated script (that is not already in the checkpoint):
-1. Call `code_validator_agent` with the script text.
-2. If the validator returns "VALIDATED_SCRIPT:": extract the corrected script text.
-   Call `store_validation_cache_fn` with that extracted script and status "VALIDATED".
-   The extracted script MUST be byte-for-byte identical to what you pass to `append_candidate_script_fn`.
-   Immediately call `append_candidate_script_fn` with name, extracted script, and architecture.
-3. If the validator returns "VALIDATION_FAILED": call `store_validation_cache_fn` with the
-   original script and status "VALIDATION_FAILED". Skip saving that script.
-
-This saves each script as soon as it is validated, so progress is never lost on restart.
+This is the only family where `concat([f_L, f_R, |f_L - f_R|])` is required (shared
+weights + feature-level abs difference + 3x concat width).
 
 ---
 ## Important rules
-- Always call the tools in order: ensure_data_split → load_candidate_scripts → (if needed) generate → validate+save each one.
-- Save immediately after each validation — do not batch them.
-- Do not emit the scripts as plain text in your final response.
-- Your final text response should be a short summary: how many scripts were saved and their names.
+- Tool order: ensure_data_split → load_candidate_scripts → (if needed) load_retrieved_candidates → author + save each block.
+- Save each block via `append_candidate_block_fn` as soon as it is written — do not batch.
+  The tool validates and persists; on "BLOCK_REJECTED" fix the block and retry (max 2 retries per candidate).
+- Do not emit blocks or scripts as plain text in your final response.
+- Your final text response should be a short summary: how many candidates were saved and their names.
 """
 
 # ---------------------------------------------------------------------------
@@ -509,10 +471,7 @@ baseline_coder_agent = LlmAgent(
         _ensure_data_split_tool,
         _load_candidate_scripts_tool,
         _load_retrieved_candidates_tool,
-        _get_script_template_tool,
-        _append_candidate_script_tool,
-        code_validator_tool,
-        store_validation_cache_tool,
+        _append_candidate_block_tool,
     ],
     include_contents="none",
     after_model_callback=count_tokens_callback,

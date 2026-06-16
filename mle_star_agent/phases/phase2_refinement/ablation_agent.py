@@ -10,6 +10,7 @@ from mle_star_agent import config
 from mle_star_agent.guards.code_validator_agent import code_validator_tool
 from mle_star_agent.shared import code_runner, metric_guard
 from mle_star_agent.shared.callbacks import (
+    _make_bypass_response,
     budget_stop_callback,
     count_tokens_callback,
     log_context_size_callback,
@@ -88,7 +89,8 @@ ABLATION_PROBES = [
             "but deliberately tune the optimiser and scheduler. Generate a concrete variant "
             "such as AdamW with tuned base LR, weight_decay, and CosineAnnealingWarmRestarts "
             "T_0/T_mult; SGD momentum/nesterov with ReduceLROnPlateau stepped on validation "
-            "loss; or AdamW with ReduceLROnPlateau factor/patience/min_lr. A real PyTorch "
+            "loss; or AdamW with ReduceLROnPlateau factor/patience/min_lr, without passing "
+            "verbose=. A real PyTorch "
             "learning-rate scheduler and correct scheduler.step() call remain mandatory."
         ),
     },
@@ -341,6 +343,16 @@ def check_stop_flag_fn(tool_context) -> str:
 
 check_stop_flag_tool = FunctionTool(func=check_stop_flag_fn)
 
+
+def _bypass_ablation_flag(callback_context, llm_request):
+    try:
+        result = check_stop_flag_fn(callback_context)
+        return _make_bypass_response(result)
+    except Exception as exc:
+        logger.warning("bypass_ablation_flag: exception — falling back to LLM: %s", exc)
+        return None
+
+
 _FLAG_CHECKER_INSTRUCTION = """You are the Ablation Stop Flag Checker.
 
 Call `check_stop_flag_fn` immediately.
@@ -361,7 +373,7 @@ ablation_flag_checker = LlmAgent(
     instruction=_FLAG_CHECKER_INSTRUCTION,
     tools=[check_stop_flag_tool],
     include_contents="none",
-    before_model_callback=log_context_size_callback,
+    before_model_callback=[_bypass_ablation_flag, log_context_size_callback],
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )
@@ -615,6 +627,7 @@ Requirements for the diagnostic script:
 - Must preserve all other components except for the single change specified above
 - Must preserve or add a real PyTorch learning-rate schedule (`CosineAnnealingWarmRestarts`
   or `ReduceLROnPlateau`) and call `scheduler.step()` correctly in the training loop.
+  Do NOT pass `verbose=` to `ReduceLROnPlateau`; this runtime's PyTorch build rejects that keyword.
 - If ablating stereo fusion (no_stereo_fusion): load only _L images; remove _R loading
 - If NOT ablating stereo fusion: continue loading both _L and _R images
 - If the variant name starts with `no_`, remove or disable only that component.
@@ -626,7 +639,7 @@ Requirements for the diagnostic script:
   For `optimizer_lr_schedule`, change only the optimizer and LR scheduler block:
   use a concrete, labeled combination such as AdamW+CosineAnnealingWarmRestarts,
   SGD(momentum=0.9, nesterov=True)+ReduceLROnPlateau, or AdamW+ReduceLROnPlateau,
-  and preserve DRY_RUN, `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20`, early
+  without passing `verbose=`, and preserve DRY_RUN, `epochs = DRY_RUN_EPOCHS if DRY_RUN else 20`, early
   stopping, and EPOCH_LOG output.
 
 ---
@@ -789,6 +802,16 @@ def consolidate_ablation_results_fn(tool_context) -> str:
 
 _consolidate_tool = FunctionTool(func=consolidate_ablation_results_fn)
 
+
+def _bypass_ablation_agg(callback_context, llm_request):
+    try:
+        result = consolidate_ablation_results_fn(callback_context)
+        return _make_bypass_response(result)
+    except Exception as exc:
+        logger.warning("bypass_ablation_agg: exception — falling back to LLM: %s", exc)
+        return None
+
+
 _AGGREGATOR_INSTRUCTION = """You are the Ablation Aggregator Agent.
 
 Steps:
@@ -820,7 +843,7 @@ ablation_aggregator_agent = LlmAgent(
     instruction=_AGGREGATOR_INSTRUCTION,
     tools=[_consolidate_tool],
     include_contents="none",
-    before_model_callback=log_context_size_callback,
+    before_model_callback=[_bypass_ablation_agg, log_context_size_callback],
     after_model_callback=count_tokens_callback,
     on_model_error_callback=rate_limit_retry_callback,
 )

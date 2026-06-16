@@ -36,6 +36,47 @@ DATASET_FOLDERS = sorted(glob.glob(str(PROJECT_ROOT / DATASET_GLOB)))
 FAIL_LABELS = {"fail", "ng", "1", "defect", "defective", "true", "positive"}
 PASS_LABELS = {"pass", "ok", "g", "good", "0", "false", "negative"}
 
+# ─── Split strategy ──────────────────────────────────────────────────────────
+# Controls how the 404 samples are divided into train / val / test.
+#
+#   "grouped" — whole board groups (lots) are assigned to partitions so no lot
+#               appears in both train and test. With 3 lots this means one lot
+#               goes entirely to train, the other two split val+test. This is
+#               the cross-lot (leave-one-lot-out) regime — the "hard" exam.
+#
+#   "mixed"   — simple stratified random split; all 3 lots are represented in
+#               train, val AND test. This is the in-distribution exam and is
+#               where the 0.65–0.71 results came from. Good for validating that
+#               a model can learn the task at all, before tackling the lot wall.
+#
+SPLIT_STRATEGY = "mixed"  # "grouped" | "mixed"
+
+# ─── Label granularity (board vs per-side) ───────────────────────────────────
+# Controls how a physical board's stereo pair is turned into training samples.
+#
+#   "board"    — one 9-channel stereo sample per board, labelled by the board's
+#                G/NG TestResult (the original pipeline).
+#   "per_side" — each side image becomes its own 3-channel mono sample, labelled
+#                NG iff its OWN NG_SUM>0. This doubles the sample count and removes
+#                the "clean-side dilution" (in SUP046 ~68% of failing boards fail
+#                on only one side, so the clean side was being taught the wrong
+#                label under board labelling). At evaluation the two sides are
+#                pooled back to a board score (max over sides) so the headline
+#                metric stays the board-level G/NG AUC, apples-to-apples with
+#                "board" mode.
+#
+# Validated on SUP046 A/B relabel experiments: per_side lifts the
+# in-distribution board AUC 0.623 -> 0.707. HONEST NOTE: this attacks the
+# under-learning / too-few-samples axis only. It does NOT improve cross-lot
+# (leave-one-lot-out) generalisation — it adds samples, not lots, so it cannot
+# move the domain-shift "lot wall". Do not claim otherwise.
+#
+# per_side requires per-side defect counts in the label sheet. The columns are
+# auto-detected (NG_SUM_L / NG_SUM_R style); if absent the pipeline falls back to
+# "board" mode with a loud warning, so the repo stays reusable for datasets that
+# only carry a board-level label.
+LABEL_GRANULARITY = "per_side"  # "board" | "per_side"
+
 # ─── Board grouping ──────────────────────────────────────────────────────────
 # Samples from the same physical board are kept in the same train/val/test
 # partition to prevent leakage. BOARD_CODE_PATTERN is a regex matched against
@@ -117,7 +158,11 @@ TRIED_APPROACHES_RECENT_K = 8   # full recent tried_approaches entries shown in 
 REFLEXION_ENABLED = True
 REFLEXION_MAX_HISTORY = 30
 PROBE_OVERKILL_REJECT_MAX = 0.90  # reject only catastrophic probes (ConvNeXt-style ≥90% overkill)
-PROBE_NG_RECALL_REJECT_MIN = 0.80  # reject probes with severe NG recall collapse
+# Severe-collapse floor for the PRE-training probe (≤5-8 epochs at threshold 0.5).
+# Was 0.80, which rejected essentially every run: even the best full models only
+# reach ~0.5 recall at probe time. Probe gates exist to catch collapse, not to
+# demand near-final recall before training has happened.
+PROBE_NG_RECALL_REJECT_MIN = 0.20
 PROBE_PROBABILITY_GAP_MIN = 0.01  # only block truly flat models (gap≈0); let borderline cases train
 
 # Architectures permanently banned from Phase 1 candidate selection.
@@ -163,7 +208,11 @@ PHASE1_SMOKE_UNCERTAINTY_BAND = 0.05  # also full-run candidates within this sco
 
 # Execution
 TIMEOUT_SECONDS = 7200  # 2 hours — ResNet18 15-epoch CPU training takes ~45-60 min per script
-DEBUG_CHECK_TIMEOUT_SECONDS = 120  # cap for debug_mode smoke runs (max_epochs=1, 5% data)
+DEBUG_CHECK_TIMEOUT_SECONDS = 240  # cap for debug_mode smoke runs (short-curve epochs, ~5% data)
+# Build-only prefetch pass (AOI_PREFETCH_ONLY=1) run before the first smoke run so
+# pretrained-weight downloads (e.g. DINOv2-B ≈ 330 MB) land in the local cache
+# instead of eating the smoke timeout. Network-bound, hence the generous cap.
+PREFETCH_TIMEOUT_SECONDS = 1800
 DEBUGGER_RETRY_CAP = 3
 
 # Token budget
@@ -207,9 +256,9 @@ THRESHOLD_STEP = 0.05
 RATE_LIMIT_DELAY_SECONDS = 3
 
 # Checkpoint file names
-DATA_SPLIT_VERSION = "data_split_grouped_v1"
+DATA_SPLIT_VERSION = f"data_split_{SPLIT_STRATEGY}_v1"
 CKPT_DATA_SPLIT_LEGACY = CHECKPOINT_DIR / "data_split.json"
-CKPT_DATA_SPLIT = CHECKPOINT_DIR / "data_split_grouped.json"
+CKPT_DATA_SPLIT = CHECKPOINT_DIR / f"data_split_{SPLIT_STRATEGY}.json"
 CKPT_CANDIDATE_SCRIPTS = CHECKPOINT_DIR / "candidate_scripts.json"
 CKPT_CANDIDATE_SCORES = CHECKPOINT_DIR / "candidate_scores.json"
 CKPT_L0 = CHECKPOINT_DIR / "L0.json"
